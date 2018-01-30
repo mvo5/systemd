@@ -1552,18 +1552,42 @@ static int parse_line(const char *fname, unsigned line, const char *buffer) {
                         } else {
                                 _cleanup_free_ char *uid = NULL, *gid = NULL;
                                 if (split_pair(resolved_id, ":", &uid, &gid) == 0) {
-                                        r = parse_gid(gid, &i->gid);
-                                        if (r < 0)
-                                                return log_error_errno(r, "Failed to parse GID: '%s': %m", id);
-                                        i->gid_set = true;
-                                        i->id_set_strict = true;
-                                        free_and_replace(resolved_id, uid);
-                                }
-                                r = parse_uid(resolved_id, &i->uid);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse UID: '%s': %m", id);
+                                        // try parse "group" part of "uid:group"
+                                        // as group name
+                                        Item *z;
 
-                                i->uid_set = true;
+                                        z = ordered_hashmap_get(groups, gid);
+                                        if (z) {
+                                                                                        printf("xxxxx %s %p %i\n", gid,z,z->gid);
+
+                                                i->gid = z->gid;
+                                                i->gid_set = true;
+                                        }
+                                        if (!i->gid_set) {
+                                                struct group *g;
+
+                                                g = getgrnam(gid);
+                                                if (g) {
+                                                        i->gid = g->gr_gid;
+                                                        i->gid_set = true;
+                                                }
+                                        }
+                                        // now try parse as GID
+                                        if (!i->gid_set) {
+                                                r = parse_gid(gid, &i->gid);
+                                                if (r < 0)
+                                                        return log_error_errno(r, "Failed to parse GID: '%s': %m", id);
+                                                i->gid_set = true;
+                                        }
+                                        free_and_replace(resolved_id, uid);
+                                        i->id_set_strict = true;
+                                }
+                                if(!streq(resolved_id, "-")) {
+                                        r = parse_uid(resolved_id, &i->uid);
+                                        if (r < 0)
+                                                return log_error_errno(r, "Failed to parse UID: '%s': %m", id);
+                                        i->uid_set = true;
+                                }
                         }
                 }
 
