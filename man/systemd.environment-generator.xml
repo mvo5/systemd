@@ -72,7 +72,7 @@
 
     <para>After installing new generators or updating the configuration, <command>systemctl
     daemon-reload</command> may be executed. This will re-run all generators, updating environment
-    configuration. It will be used for any services that are started subsequently.</para>
+    configuration. It will be used for any services that are started subsequently. Note that for system environment generators a full <command>systemctl daemon-reexec</command> is required so that the changes take effect.</para>
 
     <para>Environment file generators are executed similarly to unit file generators described
     in
