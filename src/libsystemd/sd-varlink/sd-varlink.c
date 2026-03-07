@@ -29,6 +29,7 @@
 #include "pidref.h"
 #include "process-util.h"
 #include "socket-util.h"
+#include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
@@ -311,9 +312,51 @@ static int ssh_path(const char **ret) {
         return 0;
 }
 
-static int varlink_connect_ssh_unix(sd_varlink **ret, const char *where) {
+static int varlink_connect_ssh(sd_varlink **ret, const char *ssh, char **cmdline) {
         _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         _cleanup_(pidref_done_sigkill_wait) PidRef pidref = PIDREF_NULL;
+        int r;
+
+        assert(ret);
+        assert(ssh);
+        assert(!strv_isempty(cmdline));
+
+        if (socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0, pair) < 0)
+                return log_debug_errno(errno, "Failed to allocate AF_UNIX socket pair: %m");
+
+        r = pidref_safe_fork_full(
+                        "(sd-vlssh)",
+                        /* stdio_fds= */ (int[]) { pair[1], pair[1], STDERR_FILENO },
+                        /* except_fds= */ NULL,
+                        /* n_except_fds= */ 0,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REOPEN_LOG|FORK_RLIMIT_NOFILE_SAFE|FORK_REARRANGE_STDIO,
+                        &pidref);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to spawn process: %m");
+        if (r == 0) {
+                /* Child */
+                execvp(ssh, cmdline);
+                log_debug_errno(errno, "Failed to invoke SSH: %m");
+                _exit(EXIT_FAILURE);
+        }
+
+        pair[1] = safe_close(pair[1]);
+
+        sd_varlink *v;
+        r = varlink_new(&v);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to create varlink object: %m");
+
+        v->output_fd = v->input_fd = TAKE_FD(pair[0]);
+        v->af = AF_UNIX;
+        v->exec_pidref = TAKE_PIDREF(pidref);
+        varlink_set_state(v, VARLINK_IDLE_CLIENT);
+
+        *ret = v;
+        return 0;
+}
+
+static int varlink_connect_ssh_unix(sd_varlink **ret, const char *where) {
         int r;
 
         assert_return(ret, -EINVAL);
@@ -348,52 +391,22 @@ static int varlink_connect_ssh_unix(sd_varlink **ret, const char *where) {
 
         log_debug("Forking off SSH child process '%s -W %s %s'.", ssh, p, h);
 
-        if (socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0, pair) < 0)
-                return log_debug_errno(errno, "Failed to allocate AF_UNIX socket pair: %m");
+        _cleanup_strv_free_ char **cmdline = strv_new(ssh, "-W", p, h);
+        if (!cmdline)
+                return log_oom_debug();
 
-        r = pidref_safe_fork_full(
-                        "(sd-vlssh)",
-                        /* stdio_fds= */ (int[]) { pair[1], pair[1], STDERR_FILENO },
-                        /* except_fds= */ NULL,
-                        /* n_except_fds= */ 0,
-                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REOPEN_LOG|FORK_RLIMIT_NOFILE_SAFE|FORK_REARRANGE_STDIO,
-                        &pidref);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to spawn process: %m");
-        if (r == 0) {
-                /* Child */
-
-                execlp(ssh, "ssh", "-W", p, h, NULL);
-                log_debug_errno(errno, "Failed to invoke %s: %m", ssh);
-                _exit(EXIT_FAILURE);
-        }
-
-        pair[1] = safe_close(pair[1]);
-
-        sd_varlink *v;
-        r = varlink_new(&v);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to create varlink object: %m");
-
-        v->output_fd = v->input_fd = TAKE_FD(pair[0]);
-        v->af = AF_UNIX;
-        v->exec_pidref = TAKE_PIDREF(pidref);
-        varlink_set_state(v, VARLINK_IDLE_CLIENT);
-
-        *ret = v;
-        return 0;
+        return varlink_connect_ssh(ret, ssh, cmdline);
 }
 
 static int varlink_connect_ssh_exec(sd_varlink **ret, const char *where) {
-        _cleanup_close_pair_ int input_pipe[2] = EBADF_PAIR, output_pipe[2] = EBADF_PAIR;
-        _cleanup_(pidref_done_sigkill_wait) PidRef pidref = PIDREF_NULL;
         int r;
 
         assert_return(ret, -EINVAL);
         assert_return(where, -EINVAL);
 
-        /* Connects to an SSH server to connect to a remote process' stdin/stdout. For now we do not expose
-         * this function directly, but only via varlink_connect_url(). */
+        /* Connects to an SSH server to connect to a remote Varlink service by command. The command is invoked
+         * on the remote side with SYSTEMD_VARLINK_LISTEN=- so that it accepts the varlink connection on
+         * stdin/stdout. For now we do not expose this function directly, but only via varlink_connect_url(). */
 
         const char *ssh;
         r = ssh_path(&ssh);
@@ -402,79 +415,27 @@ static int varlink_connect_ssh_exec(sd_varlink **ret, const char *where) {
 
         const char *e = strchr(where, ':');
         if (!e)
-                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "SSH specification lacks a : separator between host and path, refusing: %s", where);
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "SSH specification lacks a : separator between host and command, refusing: %s", where);
 
         _cleanup_free_ char *h = strndup(where, e - where);
         if (!h)
                 return log_oom_debug();
 
-        _cleanup_strv_free_ char **cmdline = NULL;
-        r = strv_split_full(&cmdline, e + 1, /* separators= */ NULL, EXTRACT_CUNESCAPE|EXTRACT_UNQUOTE);
+        _cleanup_strv_free_ char **remote_cmdline = NULL;
+        r = strv_split_full(&remote_cmdline, e + 1, /* separators= */ NULL, EXTRACT_CUNESCAPE|EXTRACT_UNQUOTE);
         if (r < 0)
                 return log_debug_errno(r, "Failed to split command line: %m");
-        if (strv_isempty(cmdline))
+        if (strv_isempty(remote_cmdline))
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Remote command line is empty, refusing.");
 
-        _cleanup_strv_free_ char **full_cmdline = NULL;
-        full_cmdline = strv_new("ssh", "-e", "none", "-T", h, "env", "SYSTEMD_VARLINK_LISTEN=-");
-        if (!full_cmdline)
+        _cleanup_strv_free_ char **cmdline = strv_new(ssh, "-e", "none", "-T", h, "env", "SYSTEMD_VARLINK_LISTEN=-");
+        if (!cmdline)
                 return log_oom_debug();
-        r = strv_extend_strv_consume(&full_cmdline, TAKE_PTR(cmdline), /* filter_duplicates= */ false);
+        r = strv_extend_strv_consume(&cmdline, TAKE_PTR(remote_cmdline), /* filter_duplicates= */ false);
         if (r < 0)
-                return log_oom_debug();
-
-        _cleanup_free_ char *j = NULL;
-        j = quote_command_line(full_cmdline, SHELL_ESCAPE_EMPTY);
-        if (!j)
                 return log_oom_debug();
 
-        log_debug("Forking off SSH child process: %s", j);
-
-        if (pipe2(input_pipe, O_CLOEXEC) < 0)
-                return log_debug_errno(errno, "Failed to allocate input pipe: %m");
-        if (pipe2(output_pipe, O_CLOEXEC) < 0)
-                return log_debug_errno(errno, "Failed to allocate output pipe: %m");
-
-        r = pidref_safe_fork_full(
-                        "(sd-vlssh)",
-                        /* stdio_fds= */ (int[]) { input_pipe[0], output_pipe[1], STDERR_FILENO },
-                        /* except_fds= */ NULL,
-                        /* n_except_fds= */ 0,
-                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REOPEN_LOG|FORK_RLIMIT_NOFILE_SAFE|FORK_REARRANGE_STDIO,
-                        &pidref);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to spawn process: %m");
-        if (r == 0) {
-                /* Child */
-                execvp(ssh, full_cmdline);
-                log_debug_errno(errno, "Failed to invoke %s: %m", j);
-                _exit(EXIT_FAILURE);
-        }
-
-        input_pipe[0] = safe_close(input_pipe[0]);
-        output_pipe[1] = safe_close(output_pipe[1]);
-
-        r = fd_nonblock(input_pipe[1], true);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to make input pipe non-blocking: %m");
-
-        r = fd_nonblock(output_pipe[0], true);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to make output pipe non-blocking: %m");
-
-        sd_varlink *v;
-        r = varlink_new(&v);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to create varlink object: %m");
-
-        v->input_fd = TAKE_FD(output_pipe[0]);
-        v->output_fd = TAKE_FD(input_pipe[1]);
-        v->af = AF_UNSPEC;
-        v->exec_pidref = TAKE_PIDREF(pidref);
-        varlink_set_state(v, VARLINK_IDLE_CLIENT);
-
-        *ret = v;
-        return 0;
+        return varlink_connect_ssh(ret, ssh, cmdline);
 }
 
 /* Do basic validation of the URL scheme (loosely following RFC 1738) */
@@ -3964,6 +3925,19 @@ _public_ int sd_varlink_server_add_connection_stdio(sd_varlink_server *s, sd_var
         struct stat output_st;
         if (fstat(output_fd, &output_st) < 0)
                 return -errno;
+
+        /* If stdin/stdout refer to the same socket (e.g. a dup'd socketpair end), use a single fd for
+         * both directions. This allows getpeercred() to work and is more efficient. */
+        if (stat_inode_same(&input_st, &output_st) && S_ISSOCK(input_st.st_mode)) {
+                output_fd = safe_close(output_fd);
+
+                r = sd_varlink_server_add_connection_pair(s, input_fd, input_fd, /* override_ucred= */ NULL, ret);
+                if (r < 0)
+                        return r;
+
+                TAKE_FD(input_fd);
+                return 0;
+        }
 
         /* If stdin/stdout are both pipes and have the same owning uid/gid then let's synthesize a "struct
          * ucred" from the owning UID/GID, since we got them passed in with such ownership. We'll not fill in
