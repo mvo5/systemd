@@ -289,9 +289,10 @@ f = conn.makefile("rwb")
 f.write(b"<<< UPGRADED >>>\n")
 f.write((json.dumps(received_parameters) + "\n").encode())
 f.flush()
-data = f.read().decode().rstrip("\n")
-f.write((data[::-1] + "\n").encode())
-f.flush()
+for line in f:
+    text = line.decode().rstrip("\n")
+    f.write((text[::-1] + "\n").encode())
+    f.flush()
 
 conn.close()
 sock.close()
@@ -312,3 +313,23 @@ echo "$result" | grep '"foo": "bar"' >/dev/null
 echo "$result" | grep "dlrow olleh" >/dev/null
 
 wait "$SERVER_PID" || :
+
+# Start another server for --exec test
+rm -f "$UPGRADE_SOCKET"
+python3 "$UPGRADE_SERVER" "$UPGRADE_SOCKET" &
+SERVER_PID=$!
+timeout 5 bash -c "while [ ! -S '$UPGRADE_SOCKET' ]; do sleep 0.1; done"
+
+# Test --exec mode: the upgraded socket becomes stdin/stdout of the child.
+# Since stdout goes to the socket (not the terminal), write results to a file for verification.
+EXEC_RESULT="$(mktemp)"
+varlinkctl call --upgrade --exec "unix:$UPGRADE_SOCKET" io.systemd.test.Reverse '{"foo":"bar"}' -- \
+        bash -c "head -2 > '$EXEC_RESULT'; echo 'hello world'; head -1 >> '$EXEC_RESULT'"
+grep "<<< UPGRADED >>>" "$EXEC_RESULT" >/dev/null
+grep '"foo": "bar"' "$EXEC_RESULT" >/dev/null
+grep "dlrow olleh" "$EXEC_RESULT" >/dev/null
+rm -f "$EXEC_RESULT"
+
+wait "$SERVER_PID" || :
+rm -f "$UPGRADE_SOCKET" "$UPGRADE_SERVER"
+rm -rf "$(dirname "$UPGRADE_SOCKET")"
