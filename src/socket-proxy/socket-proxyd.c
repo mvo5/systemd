@@ -138,12 +138,17 @@ static int connection_forward_done(SocketForward *sf, int error, void *userdata)
 }
 
 static int connection_complete(Connection *c) {
+        int server_fd, client_fd;
+
         assert(c);
+
+        server_fd = TAKE_FD(c->server_fd);
+        client_fd = TAKE_FD(c->client_fd);
 
         return socket_forward_new(
                         c->context->event,
-                        TAKE_FD(c->server_fd),
-                        TAKE_FD(c->client_fd),
+                        server_fd, server_fd,   /* bidirectional server socket */
+                        client_fd, client_fd,   /* bidirectional client socket */
                         connection_forward_done, c,
                         &c->forward);
 }

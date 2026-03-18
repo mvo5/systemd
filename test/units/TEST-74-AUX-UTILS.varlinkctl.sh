@@ -312,5 +312,20 @@ echo "$result" | grep '"foo": "bar"' >/dev/null
 echo "$result" | grep "dlrow olleh" >/dev/null
 
 wait "$SERVER_PID" || :
-rm -f "$UPGRADE_SOCKET" "$UPGRADE_SERVER"
-rm -rf "$(dirname "$UPGRADE_SOCKET")"
+
+# Test --upgrade with stdin redirected from a regular file (epoll can't poll regular files,
+# so this exercises the fork+pipe fallback path)
+UPGRADE_SOCKET2="$(mktemp -d)/upgrade.sock"
+python3 "$UPGRADE_SERVER" "$UPGRADE_SOCKET2" &
+SERVER_PID=$!
+timeout 5 bash -c "while [ ! -S '$UPGRADE_SOCKET2' ]; do sleep 0.1; done"
+
+echo "file input test" > /tmp/test-upgrade-input
+result="$(varlinkctl call --upgrade "unix:$UPGRADE_SOCKET2" io.systemd.test.Reverse '{"foo":"file"}' < /tmp/test-upgrade-input)"
+echo "$result" | grep "<<< UPGRADED >>>" >/dev/null
+echo "$result" | grep '"foo": "file"' >/dev/null
+echo "$result" | grep "tset tupni elif" >/dev/null
+
+wait "$SERVER_PID" || :
+rm -f "$UPGRADE_SOCKET" "$UPGRADE_SOCKET2" "$UPGRADE_SERVER" /tmp/test-upgrade-input
+rm -rf "$(dirname "$UPGRADE_SOCKET")" "$(dirname "$UPGRADE_SOCKET2")"

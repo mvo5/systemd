@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
-#include <poll.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -16,9 +15,9 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "copy.h"
 #include "format-table.h"
 #include "format-util.h"
-#include "io-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "memfd-util.h"
@@ -33,6 +32,7 @@
 #include "process-util.h"
 #include "recurse-dir.h"
 #include "runtime-scope.h"
+#include "socket-forward.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
@@ -646,9 +646,16 @@ static int reply_callback(
         return r;
 }
 
+static int upgrade_forward_done(SocketForward *sf, int error, void *userdata) {
+        sd_event *event = ASSERT_PTR(userdata);
+
+        return sd_event_exit(event, error < 0 ? error : 0);
+}
+
 static int varlink_call_and_upgrade(const char *url, const char *method, sd_json_variant *parameters) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
-        _cleanup_free_ uint8_t *buf = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(socket_forward_freep) SocketForward *sf = NULL;
         _cleanup_close_ int fd = -EBADF;
         int r;
 
@@ -666,64 +673,86 @@ static int varlink_call_and_upgrade(const char *url, const char *method, sd_json
         if (r < 0)
                 return log_error_errno(r, "Failed to upgrade connection via %s(): %m", method);
 
-        /* Connection is now upgraded -- bidirectional proxy between stdin/stdout and socket */
-        buf = new(uint8_t, 64U * U64_KB); /* 64KB, like copy.c */
-        if (!buf)
-                return log_oom();
-
-        r = fd_nonblock(STDIN_FILENO, true);
+        /* Use a fresh event loop - sd_event_default() is already used by the varlink library
+         * for the synchronous call above and may have stale event sources attached. */
+        r = sd_event_new(&event);
         if (r < 0)
-                return log_error_errno(r, "Failed to set stdin to non-blocking: %m");
+                return log_error_errno(r, "Failed to allocate event loop: %m");
 
         r = fd_nonblock(fd, true);
         if (r < 0)
                 return log_error_errno(r, "Failed to set upgraded connection fd to non-blocking: %m");
 
-        struct pollfd pfds[2] = {
-                { .fd = STDIN_FILENO, .events = POLLIN },
-                { .fd = fd,           .events = POLLIN },
-        };
+        /* If stdin is a regular file (e.g. `< payload.json`), epoll will reject it with EPERM.
+         * Work around this by forking a child that streams the file into a pipe. The read end
+         * of the pipe is pollable and gets passed to the socket forwarder, giving us true
+         * bidirectional streaming even for multi-gigabyte files. */
+        _cleanup_close_ int stdin_fd = -EBADF;
+        struct stat st;
 
-        for (;;) {
-                if (pfds[0].fd < 0 && pfds[1].fd < 0)
-                        break;
+        if (fstat(STDIN_FILENO, &st) < 0)
+                return log_error_errno(errno, "Failed to stat stdin: %m");
 
-                r = poll(pfds, 2, -1);
-                if (r < 0) {
-                        if (errno == EINTR)
-                                continue;
-                        return log_error_errno(errno, "poll() failed: %m");
+        if (S_ISREG(st.st_mode)) {
+                _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
+
+                r = pipe2(pipefd, O_CLOEXEC);
+                if (r < 0)
+                        return log_error_errno(errno, "Failed to create pipe: %m");
+
+                r = pidref_safe_fork_full(
+                                "(stdin-copy)",
+                                /* stdio_fds= */ NULL,
+                                (int[]) { STDIN_FILENO, pipefd[1] }, 2,
+                                FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG,
+                                /* ret_pid= */ NULL);
+                if (r < 0)
+                        return r;
+                if (r == 0) {
+                        /* Child: stream stdin into the pipe write end, then exit.
+                         * Closing the write end signals EOF to the parent's forwarder. */
+                        r = copy_bytes(STDIN_FILENO, pipefd[1], UINT64_MAX, /* copy_flags= */ 0);
+
+                        pipefd[1] = safe_close(pipefd[1]);
+                        _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
                 }
 
-                if (pfds[0].revents & (POLLIN|POLLHUP|POLLERR)) {
-                        ssize_t n = read(STDIN_FILENO, buf, MALLOC_SIZEOF_SAFE(buf));
-                        if (n < 0) {
-                                if (!ERRNO_IS_TRANSIENT(errno))
-                                        return log_error_errno(errno, "Failed to read from stdin: %m");
-                        } else if (n == 0) {
-                                pfds[0].fd = -1;
-                                (void) shutdown(fd, SHUT_WR);
-                        } else {
-                                r = loop_write_full(fd, buf, n, USEC_INFINITY);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to write to upgraded connection: %m");
-                        }
-                }
+                /* Parent: use the pipe read end as stdin */
+                pipefd[1] = safe_close(pipefd[1]);
 
-                if (pfds[1].revents & (POLLIN|POLLHUP|POLLERR)) {
-                        ssize_t n = read(fd, buf, MALLOC_SIZEOF_SAFE(buf));
-                        if (n < 0) {
-                                if (!ERRNO_IS_TRANSIENT(errno))
-                                        return log_error_errno(errno, "Failed to read from upgraded connection: %m");
-                        } else if (n == 0)
-                                pfds[1].fd = EBADF;
-                        else {
-                                r = loop_write_full(STDOUT_FILENO, buf, n, USEC_INFINITY);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to write to stdout: %m");
-                        }
-                }
+                stdin_fd = TAKE_FD(pipefd[0]);
+        } else {
+                stdin_fd = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
+                if (stdin_fd < 0)
+                        return log_error_errno(errno, "Failed to dup stdin: %m");
         }
+
+        r = fd_nonblock(stdin_fd, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set stdin to non-blocking: %m");
+
+        r = fd_nonblock(STDOUT_FILENO, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set stdout to non-blocking: %m");
+
+        _cleanup_close_ int stdout_fd = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+        if (stdout_fd < 0)
+                return log_error_errno(errno, "Failed to dup stdout: %m");
+
+        int upgraded_fd = TAKE_FD(fd);
+
+        r = socket_forward_new(
+                        event,
+                        TAKE_FD(stdin_fd), TAKE_FD(stdout_fd),
+                        upgraded_fd, upgraded_fd,
+                        upgrade_forward_done, event,
+                        &sf);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set up socket forwarding: %m");
+
+        r = sd_event_loop(event);
+        if (r < 0)
+                return log_error_errno(r, "Event loop failed: %m");
 
         return 0;
 }
