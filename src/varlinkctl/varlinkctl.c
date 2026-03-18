@@ -656,7 +656,7 @@ static int varlink_call_and_upgrade(const char *url, const char *method, sd_json
         _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(socket_forward_freep) SocketForward *sf = NULL;
-        _cleanup_close_ int fd = -EBADF;
+        _cleanup_close_ int input_fd = -EBADF, output_fd = -EBADF;
         int r;
 
         r = varlink_connect_auto(&vl, url);
@@ -669,7 +669,8 @@ static int varlink_call_and_upgrade(const char *url, const char *method, sd_json
                         parameters,
                         /* ret_parameters= */ NULL,
                         /* ret_error_id= */ NULL,
-                        &fd);
+                        &input_fd,
+                        &output_fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to upgrade connection via %s(): %m", method);
 
@@ -679,9 +680,15 @@ static int varlink_call_and_upgrade(const char *url, const char *method, sd_json
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
-        r = fd_nonblock(fd, true);
+        r = fd_nonblock(input_fd, true);
         if (r < 0)
-                return log_error_errno(r, "Failed to set upgraded connection fd to non-blocking: %m");
+                return log_error_errno(r, "Failed to set upgraded input fd to non-blocking: %m");
+
+        if (input_fd != output_fd) {
+                r = fd_nonblock(output_fd, true);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set upgraded output fd to non-blocking: %m");
+        }
 
         /* If stdin is a regular file (e.g. `< payload.json`), epoll will reject it with EPERM.
          * Work around this by forking a child that streams the file into a pipe. The read end
@@ -739,12 +746,10 @@ static int varlink_call_and_upgrade(const char *url, const char *method, sd_json
         if (stdout_fd < 0)
                 return log_error_errno(errno, "Failed to dup stdout: %m");
 
-        int upgraded_fd = TAKE_FD(fd);
-
         r = socket_forward_new(
                         event,
                         TAKE_FD(stdin_fd), TAKE_FD(stdout_fd),
-                        upgraded_fd, upgraded_fd,
+                        TAKE_FD(input_fd), TAKE_FD(output_fd),
                         upgrade_forward_done, event,
                         &sf);
         if (r < 0)

@@ -2391,20 +2391,16 @@ _public_ int sd_varlink_call_and_upgrade(
                 sd_json_variant *parameters,
                 sd_json_variant **ret_parameters,
                 const char **ret_error_id,
-                int *ret_fd) {
+                int *ret_input_fd,
+                int *ret_output_fd) {
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *m = NULL;
         int r;
 
         assert_return(v, -EINVAL);
         assert_return(method, -EINVAL);
-        assert_return(ret_fd, -EINVAL);
-
-        /* Protocol upgrade steals the connection fd for raw I/O, which only works with a single
-         * bidirectional socket, not a pipe pair. */
-        if (v->input_fd != v->output_fd)
-                return varlink_log_errno(v, SYNTHETIC_ERRNO(EBADF),
-                                         "Protocol upgrade requires a bidirectional socket, not a pipe pair. Use sd_varlink_connect_fd() or a socket-based transport.");
+        assert_return(ret_input_fd, -EINVAL);
+        assert_return(ret_output_fd, -EINVAL);
 
         r = sd_json_buildo(
                         &m,
@@ -2439,17 +2435,24 @@ _public_ int sd_varlink_call_and_upgrade(
                 goto finish;
         }
 
-        /* Pass the connection fd to the caller, it owns it now but first reset to blocking mode
+        /* Pass the connection fds to the caller, it owns them now. Reset to blocking mode
          * since callers of the upgraded protocol will generally expect normal blocking
          * semantics. */
         r = fd_nonblock(v->input_fd, false);
         if (r < 0) {
-                varlink_log_errno(v, r, "Failed to set connection fd to blocking mode: %m");
+                varlink_log_errno(v, r, "Failed to set input fd to blocking mode: %m");
                 goto finish;
         }
+        if (v->input_fd != v->output_fd) {
+                r = fd_nonblock(v->output_fd, false);
+                if (r < 0) {
+                        varlink_log_errno(v, r, "Failed to set output fd to blocking mode: %m");
+                        goto finish;
+                }
+        }
 
-        *ret_fd = TAKE_FD(v->input_fd);
-        TAKE_FD(v->output_fd);
+        *ret_input_fd = TAKE_FD(v->input_fd);
+        *ret_output_fd = TAKE_FD(v->output_fd);
 
         varlink_set_state(v, VARLINK_DISCONNECTED);
         v->n_pending--;

@@ -136,9 +136,10 @@ int sd_varlink_callb(sd_varlink *v, const char *method, sd_json_variant **ret_pa
 #define sd_varlink_callbo(v, method, ret_parameters, ret_error_id, ...)    \
         sd_varlink_callb((v), (method), (ret_parameters), (ret_error_id), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
 
-/* Send method call with upgrade, wait for reply, then steal the connection fd for raw I/O.
+/* Send method call with upgrade, wait for reply, then steal the connection fds for raw I/O.
+ * For bidirectional sockets ret_input_fd and ret_output_fd will be the same fd.
  * ret_parameters and ret_error_id are borrowed references valid only until v is closed or unreffed. */
-int sd_varlink_call_and_upgrade(sd_varlink *v, const char *method, sd_json_variant *parameters, sd_json_variant **ret_parameters, const char **ret_error_id, int *ret_fd);
+int sd_varlink_call_and_upgrade(sd_varlink *v, const char *method, sd_json_variant *parameters, sd_json_variant **ret_parameters, const char **ret_error_id, int *ret_input_fd, int *ret_output_fd);
 
 /* Send method call and begin collecting all 'more' replies into an array, finishing when a final reply is sent */
 int sd_varlink_collect_full(sd_varlink *v, const char *method, sd_json_variant *parameters, sd_json_variant **ret_parameters, const char **ret_error_id, sd_varlink_reply_flags_t *ret_flags);
