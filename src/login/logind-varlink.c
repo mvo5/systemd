@@ -351,10 +351,8 @@ static int manager_do_shutdown_action(sd_varlink *link, sd_json_variant *paramet
         const HandleActionData *a = handle_action_lookup(action);
         assert(a);
 
-        /* TODO: provide full polkit support (matching the D-Bus verify_shutdown_creds() with
-         * multiple-sessions and inhibitor-override checks). This requires some refactor. */
-        r = varlink_check_privileged_peer(link);
-        if (r < 0)
+        r = verify_shutdown_creds(m, /* message= */ NULL, link, a, /* flags= */ 0, /* error= */ NULL);
+        if (r != 0)
                 return r;
 
         if (m->delayed_action)

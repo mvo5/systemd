@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "sd-varlink.h"
+
 #include "logind-forward.h"
 
 int manager_get_session_from_creds(Manager *m, sd_bus_message *message, const char *name, sd_bus_error *error, Session **ret);
@@ -9,6 +11,7 @@ int manager_get_seat_from_creds(Manager *m, sd_bus_message *message, const char 
 
 int manager_dispatch_delayed(Manager *manager, bool timeout);
 
+int verify_shutdown_creds(Manager *m, sd_bus_message *message, sd_varlink *link, const HandleActionData *a, uint64_t flags, sd_bus_error *error);
 int bus_manager_shutdown_or_sleep_now_or_later(Manager *m, const HandleActionData *a, sd_bus_error *error);
 
 int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *error);
