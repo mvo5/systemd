@@ -4,11 +4,14 @@
 #include "sd-event.h"
 
 #include "alloc-util.h"
+#include "bus-error.h"
+#include "bus-unit-util.h"
 #include "cgroup-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "hashmap.h"
 #include "json-util.h"
+#include "logind-action.h"
 #include "logind-session.h"
 #include "logind.h"
 #include "logind-dbus.h"
@@ -20,6 +23,7 @@
 #include "user-record.h"
 #include "user-util.h"
 #include "varlink-io.systemd.Login.h"
+#include "varlink-io.systemd.Shutdown.h"
 #include "varlink-io.systemd.service.h"
 #include "varlink-util.h"
 
@@ -336,6 +340,99 @@ static int vl_method_release_session(sd_varlink *link, sd_json_variant *paramete
         return sd_varlink_reply(link, NULL);
 }
 
+static int manager_do_shutdown_action(sd_varlink *link, sd_json_variant *parameters, HandleAction action) {
+        Manager *m = ASSERT_PTR(sd_varlink_get_userdata(link));
+        int r;
+
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, NULL);
+        if (r != 0)
+                return r;
+
+        const HandleActionData *a = handle_action_lookup(action);
+        assert(a);
+
+        /* TODO: provide full polkit support (matching the D-Bus verify_shutdown_creds() with
+         * multiple-sessions and inhibitor-override checks). This requires some refactor. */
+        r = varlink_check_privileged_peer(link);
+        if (r < 0)
+                return r;
+
+        if (m->delayed_action)
+                return sd_varlink_error(link, "io.systemd.Shutdown.AlreadyInProgress", /* parameters= */ NULL);
+
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        r = bus_manager_shutdown_or_sleep_now_or_later(m, a, &error);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to execute %s: %s",
+                                         handle_action_to_string(action),
+                                         bus_error_message(&error, r));
+
+        return sd_varlink_reply(link, NULL);
+}
+
+static int manager_do_can_shutdown_action(sd_varlink *link, sd_json_variant *parameters, HandleAction action) {
+        Manager *m = ASSERT_PTR(sd_varlink_get_userdata(link));
+        int r;
+
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, NULL);
+        if (r != 0)
+                return r;
+
+        const HandleActionData *a = handle_action_lookup(action);
+        assert(a);
+
+        _cleanup_free_ char *load_state = NULL;
+        r = unit_load_state(m->bus, a->target, &load_state);
+        if (r < 0)
+                return r;
+
+        if (!streq(load_state, "loaded"))
+                return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("result", "no"));
+
+        /* Check if the caller is privileged. For a full polkit-based check (like the D-Bus CanPowerOff
+         * method provides), the caller should use the D-Bus interface instead. Here we provide a simpler
+         * check: root gets "yes", non-root gets "challenge" (since polkit might allow them). */
+        uid_t peer_uid;
+        r = sd_varlink_get_peer_uid(link, &peer_uid);
+        if (r < 0)
+                return r;
+
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("result", peer_uid == 0 ? "yes" : "challenge"));
+}
+
+static int vl_method_power_off(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return manager_do_shutdown_action(link, parameters, HANDLE_POWEROFF);
+}
+
+static int vl_method_reboot(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return manager_do_shutdown_action(link, parameters, HANDLE_REBOOT);
+}
+
+static int vl_method_halt(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return manager_do_shutdown_action(link, parameters, HANDLE_HALT);
+}
+
+static int vl_method_kexec(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return manager_do_shutdown_action(link, parameters, HANDLE_KEXEC);
+}
+
+static int vl_method_soft_reboot(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return manager_do_shutdown_action(link, parameters, HANDLE_SOFT_REBOOT);
+}
+
+static int vl_method_can_power_off(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return manager_do_can_shutdown_action(link, parameters, HANDLE_POWEROFF);
+}
+
+static int vl_method_can_reboot(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return manager_do_can_shutdown_action(link, parameters, HANDLE_REBOOT);
+}
+
+static int vl_method_can_halt(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return manager_do_can_shutdown_action(link, parameters, HANDLE_HALT);
+}
+
+
 int manager_varlink_init(Manager *m, int fd) {
         _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
         _unused_ _cleanup_close_ int fd_close = fd;
@@ -358,14 +455,23 @@ int manager_varlink_init(Manager *m, int fd) {
         r = sd_varlink_server_add_interface_many(
                         s,
                         &vl_interface_io_systemd_Login,
+                        &vl_interface_io_systemd_Shutdown,
                         &vl_interface_io_systemd_service);
         if (r < 0)
-                return log_error_errno(r, "Failed to add Login interface to varlink server: %m");
+                return log_error_errno(r, "Failed to add varlink interfaces: %m");
 
         r = sd_varlink_server_bind_method_many(
                         s,
                         "io.systemd.Login.CreateSession",    vl_method_create_session,
                         "io.systemd.Login.ReleaseSession",   vl_method_release_session,
+                        "io.systemd.Shutdown.PowerOff",      vl_method_power_off,
+                        "io.systemd.Shutdown.Reboot",        vl_method_reboot,
+                        "io.systemd.Shutdown.Halt",          vl_method_halt,
+                        "io.systemd.Shutdown.Kexec",         vl_method_kexec,
+                        "io.systemd.Shutdown.SoftReboot",    vl_method_soft_reboot,
+                        "io.systemd.Shutdown.CanPowerOff",   vl_method_can_power_off,
+                        "io.systemd.Shutdown.CanReboot",     vl_method_can_reboot,
+                        "io.systemd.Shutdown.CanHalt",       vl_method_can_halt,
                         "io.systemd.service.Ping",           varlink_method_ping,
                         "io.systemd.service.SetLogLevel",    varlink_method_set_log_level,
                         "io.systemd.service.GetEnvironment", varlink_method_get_environment);
