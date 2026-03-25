@@ -11,7 +11,6 @@
 #include "build.h"
 #include "bus-util.h"
 #include "chase.h"
-#include "copy.h"
 #include "env-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -793,49 +792,9 @@ static int varlink_call_and_upgrade(const char *url, const char *method, sd_json
         if (r < 0)
                 return log_error_errno(r, "Failed to set upgraded output fd to non-blocking: %m");
 
-        /* If stdin is a regular file (e.g. `< payload.json`), epoll will reject it with EPERM.
-         * Work around this by forking a child that streams the file into a pipe. The read end
-         * of the pipe is pollable and gets passed to the socket forwarder, giving us true
-         * bidirectional streaming even for multi-gigabyte files. */
-        _cleanup_close_ int stdin_fd = -EBADF;
-        struct stat st;
-
-        if (fstat(STDIN_FILENO, &st) < 0)
-                return log_error_errno(errno, "Failed to stat stdin: %m");
-
-        if (S_ISREG(st.st_mode)) {
-                _cleanup_close_pair_ int pipefd[2] = EBADF_PAIR;
-
-                r = pipe2(pipefd, O_CLOEXEC);
-                if (r < 0)
-                        return log_error_errno(errno, "Failed to create pipe: %m");
-
-                r = pidref_safe_fork_full(
-                                "(stdin-copy)",
-                                /* stdio_fds= */ NULL,
-                                (int[]) { STDIN_FILENO, pipefd[1] }, 2,
-                                FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_LOG,
-                                /* ret= */ NULL);
-                if (r < 0)
-                        return r;
-                if (r == 0) {
-                        /* Child: stream stdin into the pipe write end, then exit.
-                         * Closing the write end signals EOF to the parent's forwarder. */
-                        r = copy_bytes(STDIN_FILENO, pipefd[1], UINT64_MAX, /* copy_flags= */ 0);
-
-                        pipefd[1] = safe_close(pipefd[1]);
-                        _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
-                }
-
-                /* Parent: use the pipe read end as stdin */
-                pipefd[1] = safe_close(pipefd[1]);
-
-                stdin_fd = TAKE_FD(pipefd[0]);
-        } else {
-                stdin_fd = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
-                if (stdin_fd < 0)
-                        return log_error_errno(errno, "Failed to dup stdin: %m");
-        }
+        _cleanup_close_ int stdin_fd = fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 3);
+        if (stdin_fd < 0)
+                return log_error_errno(errno, "Failed to dup stdin: %m");
 
         r = fd_nonblock(stdin_fd, true);
         if (r < 0)

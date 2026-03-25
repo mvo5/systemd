@@ -128,11 +128,13 @@ static int simplex_forward_shovel(
 static int simplex_forward_enable_event_sources(SimplexForward *fwd);
 
 static int simplex_forward_traffic_cb(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        /* fd/revents are part of the io callback signature but unused here - the fds to
+         * operate on are tracked in the SimplexForward struct. This also allows defer_cb
+         * to reuse this function directly. */
         SimplexForward *fwd = ASSERT_PTR(userdata);
         int r;
 
         assert(s);
-        assert(fd >= 0);
 
         r = simplex_forward_shovel(
                         &fwd->server_fd, fwd->server_to_client_buffer, &fwd->client_fd,
@@ -161,37 +163,54 @@ quit:
         return fwd->on_done(fwd, r, fwd->userdata);
 }
 
+static int simplex_forward_defer_cb(sd_event_source *s, void *userdata) {
+        /* Adapter for non-pollable fds: defer sources use a different callback signature
+         * than io sources. The fd and revents parameters are unused by traffic_cb. */
+        return simplex_forward_traffic_cb(s, -EBADF, 0, userdata);
+}
+
 static int simplex_forward_enable_event_sources(SimplexForward *fwd) {
-        uint32_t a = 0, b = 0;
+        bool can_read, can_write;
         int r;
 
         assert(fwd);
 
-        if (fwd->server_to_client_buffer_full < fwd->server_to_client_buffer_size)
-                a |= EPOLLIN;
+        can_read = fwd->server_to_client_buffer_full < fwd->server_to_client_buffer_size;
+        can_write = fwd->server_to_client_buffer_full > 0;
 
-        if (fwd->server_to_client_buffer_full > 0)
-                b |= EPOLLOUT;
+        /* Event sources may have been unref'd by the shovel on EOF/disconnect */
+        if (fwd->server_event_source) {
+                r = sd_event_source_set_enabled(fwd->server_event_source, can_read ? SD_EVENT_ONESHOT : SD_EVENT_OFF);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to update server event source: %m");
+        }
 
-        if (fwd->server_event_source)
-                r = sd_event_source_set_io_events(fwd->server_event_source, a);
-        else if (fwd->server_fd >= 0)
-                r = sd_event_add_io(fwd->event, &fwd->server_event_source, fwd->server_fd, a, simplex_forward_traffic_cb, fwd);
-        else
-                r = 0;
-        if (r < 0)
-                return log_debug_errno(r, "Failed to set up server event source: %m");
-
-        if (fwd->client_event_source)
-                r = sd_event_source_set_io_events(fwd->client_event_source, b);
-        else if (fwd->client_fd >= 0)
-                r = sd_event_add_io(fwd->event, &fwd->client_event_source, fwd->client_fd, b, simplex_forward_traffic_cb, fwd);
-        else
-                r = 0;
-        if (r < 0)
-                return log_debug_errno(r, "Failed to set up client event source: %m");
+        if (fwd->client_event_source) {
+                r = sd_event_source_set_enabled(fwd->client_event_source, can_write ? SD_EVENT_ONESHOT : SD_EVENT_OFF);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to update client event source: %m");
+        }
 
         return 0;
+}
+
+static int simplex_forward_create_event_source(
+                SimplexForward *fwd,
+                sd_event_source **ret,
+                int fd,
+                uint32_t events) {
+
+        int r;
+
+        r = sd_event_add_io(fwd->event, ret, fd, events, simplex_forward_traffic_cb, fwd);
+        if (r == -EPERM) {
+                /* fd is not pollable (e.g. regular file). Fall back to a defer event source
+                 * which fires on each event loop iteration. This works because regular
+                 * file are always ready for I/O so we don't need to poll. */
+                r = sd_event_add_defer(fwd->event, ret, simplex_forward_defer_cb, fwd);
+        }
+
+        return r;
 }
 
 static int simplex_forward_new(
@@ -232,6 +251,14 @@ static int simplex_forward_new(
         if (r < 0)
                 return r;
 
+        r = simplex_forward_create_event_source(fwd, &fwd->server_event_source, fwd->server_fd, EPOLLIN);
+        if (r < 0)
+                return r;
+
+        r = simplex_forward_create_event_source(fwd, &fwd->client_event_source, fwd->client_fd, EPOLLOUT);
+        if (r < 0)
+                return r;
+
         r = simplex_forward_enable_event_sources(fwd);
         if (r < 0)
                 return r;
@@ -268,7 +295,7 @@ static int socket_forward_direction_done(SimplexForward *fwd, int error, void *u
         /* Half-close the write side so the remote end sees EOF. For sockets,
          * shutdown(SHUT_WR) sends FIN while keeping the fd open for the read side
          * (which belongs to the other direction's dup'd fd). For pipes/FIFOs,
-         * shutdown() fails with ENOTSOCK — close the fd instead, which is the
+         * shutdown() fails with ENOTSOCK - close the fd instead, which is the
          * only way to signal EOF on a pipe. */
         if (fwd->client_fd >= 0) {
                 if (shutdown(fwd->client_fd, SHUT_WR) < 0) {
