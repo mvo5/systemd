@@ -9,6 +9,7 @@
 #include "sd-varlink.h"
 
 #include "build.h"
+#include "bus-polkit.h"
 #include "bus-util.h"
 #include "chase.h"
 #include "env-util.h"
@@ -16,6 +17,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-table.h"
+#include "hashmap.h"
 #include "format-util.h"
 #include "log.h"
 #include "main-func.h"
@@ -59,6 +61,7 @@ static PushFds arg_push_fds = {};
 static bool arg_ask_password = true;
 static bool arg_legend = true;
 static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+static char *arg_polkit_action = NULL;
 
 static void push_fds_done(PushFds *p) {
         assert(p);
@@ -69,6 +72,7 @@ static void push_fds_done(PushFds *p) {
 
 STATIC_DESTRUCTOR_REGISTER(arg_graceful, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_push_fds, push_fds_done);
+STATIC_DESTRUCTOR_REGISTER(arg_polkit_action, freep);
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
@@ -119,6 +123,9 @@ static int help(void) {
                "     --upgrade           Request protocol upgrade (connection becomes raw\n"
                "                         bidirectional pipe on stdin/stdout after reply)\n"
                "     --push-fd=FD        Pass the specified fd along with method call\n"
+               "     --polkit-action=ACTION\n"
+               "                         Require polkit authorization before allowing the\n"
+               "                         varlink method call through (for serve verb)\n"
                "\nSee the %2$s for details.\n",
                program_invocation_short_name,
                link,
@@ -151,6 +158,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NO_ASK_PASSWORD,
                 ARG_USER,
                 ARG_SYSTEM,
+                ARG_POLKIT_ACTION,
         };
 
         static const struct option options[] = {
@@ -170,6 +178,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "no-ask-password", no_argument,       NULL, ARG_NO_ASK_PASSWORD },
                 { "user",            no_argument,       NULL, ARG_USER            },
                 { "system",          no_argument,       NULL, ARG_SYSTEM          },
+                { "polkit-action",   required_argument, NULL, ARG_POLKIT_ACTION   },
                 {},
         };
 
@@ -296,6 +305,12 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_SYSTEM:
                         arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+                        break;
+
+                case ARG_POLKIT_ACTION:
+                        r = free_and_strdup_warn(&arg_polkit_action, optarg);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case '?':
@@ -1255,13 +1270,30 @@ static int varlink_server_add_interface_from_method(sd_varlink_server *s, const 
         return 0;
 }
 
+typedef struct ServeContext {
+        char **exec_cmdline;
+        sd_bus *bus;
+        Hashmap *polkit_registry;
+} ServeContext;
+
 static int method_serve_upgrade(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
-        char **exec_cmdline = ASSERT_PTR(userdata);
+        ServeContext *c = ASSERT_PTR(userdata);
         _cleanup_close_ int input_fd = -EBADF, _output_fd = -EBADF;
         int output_fd, r;
 
         if (!FLAGS_SET(flags, SD_VARLINK_METHOD_UPGRADE))
                 return sd_varlink_error(link, SD_VARLINK_ERROR_INVALID_PARAMETER, NULL);
+
+        if (arg_polkit_action) {
+                r = varlink_verify_polkit_async(
+                                link,
+                                c->bus,
+                                arg_polkit_action,
+                                /* details= */ NULL,
+                                &c->polkit_registry);
+                if (r <= 0)
+                        return r;
+        }
 
         r = sd_varlink_reply_and_upgrade(link, parameters, &input_fd, &output_fd);
         if (r < 0)
@@ -1272,7 +1304,7 @@ static int method_serve_upgrade(sd_varlink *link, sd_json_variant *parameters, s
 
         /* Copy exec_cmdline before forking: pidref_safe_fork() calls rename_process() which
          * overwrites the argv area that exec_cmdline points into. */
-        _cleanup_strv_free_ char **cmdline_copy = strv_copy(exec_cmdline);
+        _cleanup_strv_free_ char **cmdline_copy = strv_copy(c->exec_cmdline);
         if (!cmdline_copy)
                 return log_oom();
 
@@ -1297,8 +1329,9 @@ static int method_serve_upgrade(sd_varlink *link, sd_json_variant *parameters, s
 static int verb_serve(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        Hashmap *polkit_registry = NULL;
         const char *method;
-        char **exec_cmdline;
         int r, n;
 
         /* Usage: varlinkctl serve METHOD CMDLINE... */
@@ -1306,7 +1339,6 @@ static int verb_serve(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expected method name and command line.");
 
         method = argv[1];
-        exec_cmdline = argv + 2;
 
         if (!varlink_idl_qualified_symbol_name_is_valid(method))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid qualified method name: '%s'", method);
@@ -1346,7 +1378,22 @@ static int verb_serve(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to add interface for method '%s': %m", method);
 
-        sd_varlink_server_set_userdata(s, exec_cmdline);
+        if (arg_polkit_action) {
+                r = bus_open_system_watch_bind_with_description(&bus, "varlink-serve-polkit");
+                if (r < 0)
+                        return log_error_errno(r, "Failed to connect to system bus: %m");
+
+                r = sd_bus_attach_event(bus, event, 0);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to attach bus to event loop: %m");
+        }
+
+        ServeContext context = {
+                .exec_cmdline = argv + 2,
+                .bus = bus,
+                .polkit_registry = polkit_registry,
+        };
+        sd_varlink_server_set_userdata(s, &context);
 
         r = sd_varlink_server_listen_fd(s, SD_LISTEN_FDS_START);
         if (r < 0)
@@ -1362,6 +1409,7 @@ static int verb_serve(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to run event loop: %m");
 
+        hashmap_free(context.polkit_registry);
         return 0;
 }
 

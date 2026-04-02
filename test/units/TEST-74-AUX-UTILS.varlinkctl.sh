@@ -400,3 +400,29 @@ wait "$SERVE_PID" 2>/dev/null || true
 
 rm -f "$SERVE_SOCKET" /tmp/test-compressed.gz
 rm -rf "$(dirname "$SERVE_SOCKET")"
+
+# Test 3: serve with --polkit-action (polkit authorization gate)
+# As root, polkit should allow the call through.
+SERVE_SOCKET="$(mktemp -d)/serve.sock"
+systemd-socket-activate -l "$SERVE_SOCKET" -- \
+        varlinkctl serve --polkit-action=org.freedesktop.login1.power-off io.systemd.test.Reverse rev &
+SERVE_PID=$!
+timeout 5 bash -c "while [ ! -S '$SERVE_SOCKET' ]; do sleep 0.1; done"
+
+result="$(echo "polkit gated" | varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.test.Reverse '{}')"
+echo "$result" | grep "detag ktilop" >/dev/null
+kill "$SERVE_PID" 2>/dev/null || true
+wait "$SERVE_PID" 2>/dev/null || true
+
+# As unprivileged user, polkit should deny the call.
+systemd-socket-activate -l "$SERVE_SOCKET" -- \
+        varlinkctl serve --polkit-action=org.freedesktop.login1.power-off io.systemd.test.Reverse rev &
+SERVE_PID=$!
+timeout 5 bash -c "while [ ! -S '$SERVE_SOCKET' ]; do sleep 0.1; done"
+
+(! run0 -u testuser varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.test.Reverse '{}' < /dev/null)
+kill "$SERVE_PID" 2>/dev/null || true
+wait "$SERVE_PID" 2>/dev/null || true
+
+rm -f "$SERVE_SOCKET"
+rm -rf "$(dirname "$SERVE_SOCKET")"
