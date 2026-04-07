@@ -19,4 +19,9 @@ int varlink_unit_queue_job_one(
 
 int vl_method_set_unit_properties(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata);
 
+int vl_method_enqueue_job_unit(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata);
+
+void varlink_job_send_change_signal(Job *j);
+void varlink_job_send_removed_signal(Job *j);
+
 int varlink_error_no_such_unit(sd_varlink *v, const char *name);

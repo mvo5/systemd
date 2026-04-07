@@ -370,3 +370,49 @@ rm -f "$EXEC_RESULT"
 
 rm -f "$UPGRADE_SOCKET" "$UPGRADE_SOCKET2" "$UPGRADE_SERVER" /tmp/test-upgrade-input
 rm -rf "$(dirname "$UPGRADE_SOCKET")" "$(dirname "$UPGRADE_SOCKET2")"
+
+# Test io.systemd.Unit.EnqueueJob
+MANAGER_SOCKET="/run/systemd/io.systemd.Manager"
+
+# Introspect should show the EnqueueJob method
+varlinkctl introspect "$MANAGER_SOCKET" io.systemd.Unit | grep -q EnqueueJob
+
+# Create a simple oneshot test unit
+cat >/run/systemd/system/varlink-enqueue-test.service <<EOF
+[Service]
+Type=oneshot
+ExecStart=true
+EOF
+systemctl daemon-reload
+
+# Non-streaming: fire and forget, should return a jobID
+result=$(varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.EnqueueJob '{"name":"varlink-enqueue-test.service","type":"start"}')
+echo "$result" | grep -q '"jobID"'
+echo "$result" | grep -q '"unit"'
+echo "$result" | grep -q '"jobType"'
+
+# Wait for it to finish
+timeout 10 bash -c 'until systemctl show -P ActiveState varlink-enqueue-test.service | grep -q inactive; do sleep .5; done'
+
+# Streaming: should get intermediate state updates and a final result
+result=$(varlinkctl call --more "$MANAGER_SOCKET" io.systemd.Unit.EnqueueJob '{"name":"varlink-enqueue-test.service","type":"start"}')
+echo "$result" | grep -q '"state"'
+echo "$result" | grep -q '"result"'
+echo "$result" | grep -q '"done"'
+
+# Test with explicit mode
+result=$(varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.EnqueueJob '{"name":"varlink-enqueue-test.service","type":"start","mode":"fail"}')
+echo "$result" | grep -q '"jobID"'
+
+# Error case: non-existent unit
+(! varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.EnqueueJob '{"name":"nonexistent-unit-12345.service","type":"start"}')
+
+# Error case: invalid job type
+(! varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.EnqueueJob '{"name":"varlink-enqueue-test.service","type":"bogus"}')
+
+# Error case: invalid job mode
+(! varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.EnqueueJob '{"name":"varlink-enqueue-test.service","type":"start","mode":"bogus"}')
+
+# Cleanup
+rm -f /run/systemd/system/varlink-enqueue-test.service
+systemctl daemon-reload

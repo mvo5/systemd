@@ -1045,6 +1045,26 @@ static SD_VARLINK_DEFINE_METHOD(
                 SD_VARLINK_FIELD_COMMENT("The runtime properties to set."),
                 SD_VARLINK_DEFINE_INPUT_BY_TYPE(properties, UnitRuntime, 0));
 
+static SD_VARLINK_DEFINE_METHOD_FULL(
+                EnqueueJob,
+                SD_VARLINK_SUPPORTS_MORE,
+                SD_VARLINK_FIELD_COMMENT("The name of the unit to operate on."),
+                SD_VARLINK_DEFINE_INPUT(name, SD_VARLINK_STRING, 0),
+                SD_VARLINK_FIELD_COMMENT("Job type: start, stop, restart, reload, try-restart, reload-or-restart, try-reload-or-restart, verify-active."),
+                SD_VARLINK_DEFINE_INPUT(type, SD_VARLINK_STRING, 0),
+                SD_VARLINK_FIELD_COMMENT("Job mode. Defaults to 'replace' if not specified."),
+                SD_VARLINK_DEFINE_INPUT(mode, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("ID of the job."),
+                SD_VARLINK_DEFINE_OUTPUT(jobID, SD_VARLINK_INT, 0),
+                SD_VARLINK_FIELD_COMMENT("Unit name."),
+                SD_VARLINK_DEFINE_OUTPUT(unit, SD_VARLINK_STRING, 0),
+                SD_VARLINK_FIELD_COMMENT("Job type string."),
+                SD_VARLINK_DEFINE_OUTPUT(jobType, SD_VARLINK_STRING, 0),
+                SD_VARLINK_FIELD_COMMENT("Current job state: waiting, running. Set for intermediate notifications."),
+                SD_VARLINK_DEFINE_OUTPUT(state, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Final result: done, failed, canceled, timeout, dependency, skipped, etc. Set in the final reply."),
+                SD_VARLINK_DEFINE_OUTPUT(result, SD_VARLINK_STRING, SD_VARLINK_NULLABLE));
+
 SD_VARLINK_DEFINE_INTERFACE(
                 io_systemd_Unit,
                 "io.systemd.Unit",
@@ -1052,6 +1072,8 @@ SD_VARLINK_DEFINE_INTERFACE(
                 &vl_method_List,
                 SD_VARLINK_SYMBOL_COMMENT("Set unit properties"),
                 &vl_method_SetProperties,
+                SD_VARLINK_SYMBOL_COMMENT("Enqueue a job for a unit and optionally stream state updates until completion"),
+                &vl_method_EnqueueJob,
                 &vl_type_RateLimit,
                 SD_VARLINK_SYMBOL_COMMENT("An object to represent a unit's conditions"),
                 &vl_type_Condition,
