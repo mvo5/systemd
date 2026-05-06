@@ -131,6 +131,8 @@ int sd_json_variant_is_sensitive_recursive(sd_json_variant *v);
 
 int sd_json_variant_get_source(sd_json_variant *v, const char **ret_source, unsigned *ret_line, unsigned *ret_column);
 
+int sd_json_variant_path(sd_json_variant *v, char **ret);
+
 __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_json_format_flags_t) {
         SD_JSON_FORMAT_OFF              = 1 << 0,  /* disable json output, make json_variant_format() fail with -ENOEXEC */
         SD_JSON_FORMAT_NEWLINE          = 1 << 1,  /* suffix with newline */
@@ -306,6 +308,7 @@ typedef struct sd_json_dispatch_field {
 } sd_json_dispatch_field;
 
 int sd_json_dispatch_full(sd_json_variant *v, const sd_json_dispatch_field table[], sd_json_dispatch_callback_t bad, sd_json_dispatch_flags_t flags, void *userdata, const char **reterr_bad_field);
+int sd_json_dispatch_full_path(sd_json_variant *v, const sd_json_dispatch_field table[], sd_json_dispatch_callback_t bad, sd_json_dispatch_flags_t flags, void *userdata, const char **reterr_bad_field, char **reterr_bad_path);
 int sd_json_dispatch(sd_json_variant *v, const sd_json_dispatch_field table[], sd_json_dispatch_flags_t flags, void *userdata);
 
 int sd_json_dispatch_string(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);

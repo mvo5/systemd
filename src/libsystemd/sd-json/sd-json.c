@@ -2,6 +2,7 @@
 
 #include <locale.h>
 #include <stdlib.h>
+#include <threads.h>
 
 #include "sd-json.h"
 #include "sd-messages.h"
@@ -1547,6 +1548,73 @@ _public_ int sd_json_variant_get_source(sd_json_variant *v, const char **ret_sou
         if (ret_column)
                 *ret_column = json_variant_is_regular(v) ? v->column : 0;
 
+        return 0;
+}
+
+_public_ int sd_json_variant_path(sd_json_variant *v, char **ret) {
+        /* Walk the parent chain of an embedded variant, building a dotted path from the outermost
+         * ancestor to v, e.g. "Exec.SetCredential[0].value". Object fields contribute their key name
+         * (separated by '.'); array elements contribute "[i]". Returns NULL in *ret for top-level
+         * (non-embedded) variants. Best-effort for variants behind reference holders. */
+
+        _cleanup_strv_free_ char **components = NULL;
+
+        assert_return(ret, -EINVAL);
+
+        while (v && json_variant_is_regular(v) && v->is_embedded) {
+                sd_json_variant *p = v->parent;
+                if (!p || !json_variant_is_regular(p) || p->is_reference)
+                        break;
+
+                ptrdiff_t off = v - p - 1;
+                if (off < 0)
+                        break;
+                size_t idx = (size_t) off;
+
+                _cleanup_free_ char *component = NULL;
+                if (p->type == SD_JSON_VARIANT_OBJECT) {
+                        /* In an object, key/value pairs are interleaved; for a value at odd index the
+                         * key is at index-1, for a key just use its own string content. */
+                        sd_json_variant *key = (idx % 2 == 0) ? v : p + 1 + (idx - 1);
+                        const char *s = sd_json_variant_string(key);
+                        component = strdup(strempty(s));
+                } else if (p->type == SD_JSON_VARIANT_ARRAY) {
+                        if (asprintf(&component, "[%zu]", idx) < 0)
+                                component = NULL;
+                } else
+                        break;
+
+                if (!component)
+                        return -ENOMEM;
+
+                if (strv_consume(&components, TAKE_PTR(component)) < 0)
+                        return -ENOMEM;
+
+                v = p;
+        }
+
+        if (strv_isempty(components)) {
+                *ret = NULL;
+                return 0;
+        }
+
+        strv_reverse(components);
+
+        _cleanup_free_ char *path = NULL;
+        STRV_FOREACH(c, components) {
+                _cleanup_free_ char *next = NULL;
+                if (!path)
+                        next = strdup(*c);
+                else if ((*c)[0] == '[')
+                        next = strjoin(path, *c);
+                else
+                        next = strjoin(path, ".", *c);
+                if (!next)
+                        return -ENOMEM;
+                free_and_replace(path, next);
+        }
+
+        *ret = TAKE_PTR(path);
         return 0;
 }
 
@@ -5164,6 +5232,18 @@ static void* dispatch_userdata(const sd_json_dispatch_field *p, void *userdata) 
         return SIZE_TO_PTR(p->offset);
 }
 
+/* When path tracking is enabled (by sd_json_dispatch_full_path() at the outermost level), every nested
+ * sd_json_dispatch_full() failure records its failing variant here unless one is already recorded. Since
+ * deeper failures happen first (the inner callback returns to the outer), this naturally captures the
+ * deepest-failing variant. The outermost sd_json_dispatch_full_path() pops it and resolves to a path. */
+static thread_local sd_json_variant *deepest_dispatch_failure = NULL;
+static thread_local bool dispatch_path_tracking = false;
+
+static void record_dispatch_failure(sd_json_variant *v) {
+        if (dispatch_path_tracking && !deepest_dispatch_failure)
+                deepest_dispatch_failure = v;
+}
+
 _public_ int sd_json_dispatch_full(
                 sd_json_variant *v,
                 const sd_json_dispatch_field table[],
@@ -5188,6 +5268,7 @@ _public_ int sd_json_dispatch_full(
                 if (reterr_bad_field)
                         *reterr_bad_field = NULL;
 
+                record_dispatch_failure(v);
                 return -EINVAL;
         }
 
@@ -5230,6 +5311,7 @@ _public_ int sd_json_dispatch_full(
                                 if (reterr_bad_field)
                                         *reterr_bad_field = p->name;
 
+                                record_dispatch_failure(value);
                                 return -EINVAL;
                         }
 
@@ -5246,6 +5328,7 @@ _public_ int sd_json_dispatch_full(
                                 if (reterr_bad_field)
                                         *reterr_bad_field = p->name;
 
+                                record_dispatch_failure(value);
                                 return -EINVAL;
                         }
 
@@ -5258,6 +5341,7 @@ _public_ int sd_json_dispatch_full(
                                 if (reterr_bad_field)
                                         *reterr_bad_field = p->name;
 
+                                record_dispatch_failure(value);
                                 return -ENOTUNIQ;
                         }
 
@@ -5272,6 +5356,7 @@ _public_ int sd_json_dispatch_full(
                                         if (reterr_bad_field)
                                                 *reterr_bad_field = sd_json_variant_string(key);
 
+                                        record_dispatch_failure(value);
                                         return r;
                                 }
                         }
@@ -5289,6 +5374,7 @@ _public_ int sd_json_dispatch_full(
                                         if (reterr_bad_field)
                                                 *reterr_bad_field = sd_json_variant_string(key);
 
+                                        record_dispatch_failure(value);
                                         return r;
                                 } else
                                         done++;
@@ -5304,6 +5390,7 @@ _public_ int sd_json_dispatch_full(
                                 if (reterr_bad_field)
                                         *reterr_bad_field = sd_json_variant_string(key);
 
+                                record_dispatch_failure(value);
                                 return -EADDRNOTAVAIL;
                         }
                 }
@@ -5321,11 +5408,46 @@ _public_ int sd_json_dispatch_full(
                         if (reterr_bad_field)
                                 *reterr_bad_field = p->name;
 
+                        record_dispatch_failure(v);
                         return -ENXIO;
                 }
         }
 
         return done;
+}
+
+_public_ int sd_json_dispatch_full_path(
+                sd_json_variant *v,
+                const sd_json_dispatch_field table[],
+                sd_json_dispatch_callback_t bad,
+                sd_json_dispatch_flags_t flags,
+                void *userdata,
+                const char **reterr_bad_field,
+                char **reterr_bad_path) {
+
+        /* Like sd_json_dispatch_full(), but additionally returns a dotted path identifying the
+         * deepest-failing variant in the dispatch tree (e.g. "Exec.SetCredential[0].value"). Path
+         * tracking transparently spans nested sd_json_dispatch_full() / sd_json_dispatch() calls
+         * within callbacks; the deepest variant wins. Pass NULL for reterr_bad_path to get just the
+         * top-level field name in reterr_bad_field. */
+
+        bool was_tracking = dispatch_path_tracking;
+
+        if (!was_tracking) {
+                dispatch_path_tracking = true;
+                deepest_dispatch_failure = NULL;
+        }
+
+        int r = sd_json_dispatch_full(v, table, bad, flags, userdata, reterr_bad_field);
+
+        if (!was_tracking) {
+                if (r < 0 && reterr_bad_path && deepest_dispatch_failure)
+                        (void) sd_json_variant_path(deepest_dispatch_failure, reterr_bad_path);
+                dispatch_path_tracking = false;
+                deepest_dispatch_failure = NULL;
+        }
+
+        return r;
 }
 
 _public_ int sd_json_dispatch(

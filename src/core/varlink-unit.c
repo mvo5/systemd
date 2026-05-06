@@ -894,6 +894,7 @@ int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters
         };
         Manager *manager = ASSERT_PTR(userdata);
         const char *bad_field = NULL;
+        _cleanup_free_ char *bad_path = NULL;
         Unit *u;
         int r;
 
@@ -904,7 +905,7 @@ int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters
         if (r < 0)
                 return r;
 
-        r = sd_json_dispatch_full(parameters, dispatch_table, /* bad= */ NULL, /* flags= */ 0, &p, &bad_field);
+        r = sd_json_dispatch_full_path(parameters, dispatch_table, /* bad= */ NULL, /* flags= */ 0, &p, &bad_field, &bad_path);
         if (r < 0) {
                 /* An unknown field in 'context' maps to PropertyNotSupported (the field is defined in the
                  * UnitContext schema but cannot be set at creation time). Anything else is a bad parameter. */
@@ -913,6 +914,11 @@ int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters
                                         link,
                                         "io.systemd.Unit.PropertyNotSupported",
                                         SD_JSON_BUILD_PAIR_STRING("property", p.unsupported_property));
+                /* For dispatch-time validation failures (type mismatch, invalid value, missing
+                 * mandatory etc.), surface the dotted path of the offending field so callers can pinpoint
+                 * the problem inside nested structures. */
+                if (bad_path)
+                        return sd_varlink_error_invalid_parameter_name(link, bad_path);
                 if (bad_field)
                         return sd_varlink_error_invalid_parameter_name(link, bad_field);
                 return r;

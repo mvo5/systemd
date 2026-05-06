@@ -634,6 +634,10 @@ varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.StartTransient \
 defer_transient_cleanup varlink-transient-badpath.service
 varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.StartTransient \
     '{"context":{"ID":"varlink-transient-badpath.service","Service":{"Type":"simple","ExecStart":[{"path":""}]}}}' |& grep "io.systemd.Unit.BadUnitSetting"
+# Dispatch-time validation failure: invalid unit name. The error response identifies the offending
+# field by its dotted path through nested objects (context.ID) rather than just "context".
+varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.StartTransient \
+    '{"context":{"ID":"not a valid unit name"}}' |& grep '"parameter":"context.ID"'
 set -o pipefail
 
 transient_cleanup

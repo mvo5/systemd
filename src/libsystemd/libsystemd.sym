@@ -1102,4 +1102,6 @@ global:
         sd_event_add_io_pressure;
         sd_event_source_set_io_pressure_type;
         sd_event_source_set_io_pressure_period;
+        sd_json_variant_path;
+        sd_json_dispatch_full_path;
 } LIBSYSTEMD_260;
