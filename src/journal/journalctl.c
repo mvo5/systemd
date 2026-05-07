@@ -348,6 +348,10 @@ static int vl_server(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to bind Varlink method: %m");
 
+        r = sd_varlink_server_bind_disconnect(varlink_server, vl_get_entries_disconnect);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind Varlink disconnect handler: %m");
+
         r = sd_varlink_server_loop_auto(varlink_server);
         if (r < 0)
                 return log_error_errno(r, "Failed to run Varlink event loop: %m");

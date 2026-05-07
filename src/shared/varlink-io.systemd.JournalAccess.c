@@ -15,7 +15,11 @@ static SD_VARLINK_DEFINE_METHOD_FULL(
                 SD_VARLINK_DEFINE_INPUT(namespace, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("Filter output by message priorities or priority ranges (i.e. between 0/'emerg' and 7/'debug')"),
                 SD_VARLINK_DEFINE_INPUT(priority, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
-                SD_VARLINK_FIELD_COMMENT("Maximum number of entries to return. Defaults to 100, capped at 10000."),
+                SD_VARLINK_FIELD_COMMENT("If specified, only return entries with the given _SYSTEMD_INVOCATION_ID. Useful in combination with follow=true to tail the output of a single unit invocation (e.g. one started via io.systemd.Unit.StartTransient())."),
+                SD_VARLINK_DEFINE_INPUT(invocationId, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("If true, after returning historical entries, keep the call open and emit further entries as they arrive in the journal. The call only completes when the client closes the connection. When set, 'limit' is ignored and the seek starts from the head of the journal (so no entries are missed for the requested invocation)."),
+                SD_VARLINK_DEFINE_INPUT(follow, SD_VARLINK_BOOL, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Maximum number of entries to return. Defaults to 100, capped at 10000. Ignored when follow=true."),
                 SD_VARLINK_DEFINE_INPUT(limit, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
                 SD_VARLINK_FIELD_COMMENT("The journal entry in flat JSON format, matching journalctl --output=json."),
                 SD_VARLINK_DEFINE_OUTPUT(entry, SD_VARLINK_OBJECT, 0));
