@@ -265,6 +265,17 @@ test -n "$fragment"
 grep '^RootHash=/etc/hostname$'          "$fragment" >/dev/null
 grep '^RootHashSignature=/etc/machine-id$' "$fragment" >/dev/null
 
+# Service.Exec* command lists (covers DEFINE_APPLY_SERVICE_EXEC_LIST macro for the Exec* family)
+defer_transient_cleanup varlink-transient-execlist.service
+varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.StartTransient \
+    '{"context":{"ID":"varlink-transient-execlist.service","Service":{"Type":"oneshot","RemainAfterExit":true,"ExecStartPre":[{"path":"/bin/true"}],"ExecStart":[{"path":"/bin/true"}],"ExecStartPost":[{"path":"/bin/true"}],"ExecStop":[{"path":"/bin/true"}],"ExecStopPost":[{"path":"/bin/true"}]}}}' >/dev/null
+timeout 30 bash -c 'until systemctl is-active varlink-transient-execlist.service; do sleep 0.5; done'
+systemctl show -P ExecStartPre  varlink-transient-execlist.service | grep '/bin/true' >/dev/null
+systemctl show -P ExecStart     varlink-transient-execlist.service | grep '/bin/true' >/dev/null
+systemctl show -P ExecStartPost varlink-transient-execlist.service | grep '/bin/true' >/dev/null
+systemctl show -P ExecStop      varlink-transient-execlist.service | grep '/bin/true' >/dev/null
+systemctl show -P ExecStopPost  varlink-transient-execlist.service | grep '/bin/true' >/dev/null
+
 # Error cases: verify specific varlink error types
 set +o pipefail
 varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.StartTransient \
@@ -343,9 +354,9 @@ echo "$unsupported_exec" | grep "Exec.AmbientCapabilities"
 # and the offending sub-property is identified
 defer_transient_cleanup varlink-transient-unknown-service.service
 unsupported_service=$(varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.StartTransient \
-    '{"context":{"ID":"varlink-transient-unknown-service.service","Service":{"Type":"oneshot","Restart":"always","ExecStart":[{"path":"/bin/true"}]}}}' 2>&1 || true)
+    '{"context":{"ID":"varlink-transient-unknown-service.service","Service":{"Type":"oneshot","PIDFile":"/run/foo.pid","ExecStart":[{"path":"/bin/true"}]}}}' 2>&1 || true)
 echo "$unsupported_service" | grep "io.systemd.Unit.PropertyNotSupported"
-echo "$unsupported_service" | grep "Service.Restart"
+echo "$unsupported_service" | grep "Service.PIDFile"
 set -o pipefail
 
 transient_cleanup

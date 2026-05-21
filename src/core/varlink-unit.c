@@ -660,8 +660,12 @@ static void transient_exec_command_item_done(TransientExecCommandItem *i) {
         strv_free(i->arguments);
 }
 
-static JSON_DISPATCH_ENUM_DEFINE(dispatch_service_type, ServiceType, service_type_from_string);
-static JSON_DISPATCH_ENUM_DEFINE(dispatch_job_mode, JobMode, job_mode_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_service_type,         ServiceType,        service_type_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_service_restart,      ServiceRestart,     service_restart_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_service_restart_mode, ServiceRestartMode, service_restart_mode_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_notify_access,        NotifyAccess,       notify_access_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_oom_policy,           OOMPolicy,          oom_policy_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_job_mode,             JobMode,            job_mode_from_string);
 
 typedef struct TransientWorkingDirectory {
         const char *path;
@@ -738,48 +742,81 @@ static void transient_exec_context_parameters_done(TransientExecContextParameter
 typedef struct TransientServiceParameters {
         bool present;
         ServiceType type;
+        ServiceRestart restart;
+        ServiceRestartMode restart_mode;
+        NotifyAccess notify_access;
+        OOMPolicy oom_policy;
+        int remain_after_exit;
+        int guess_main_pid;
+        /* Exec* command lists. Each is an array of ExecCommand items (path + arguments). */
+        TransientExecCommandItem *exec_condition;
+        size_t n_exec_condition;
+        TransientExecCommandItem *exec_reload;
+        size_t n_exec_reload;
         TransientExecCommandItem *exec_start;
         size_t n_exec_start;
-        int remain_after_exit;
+        TransientExecCommandItem *exec_start_post;
+        size_t n_exec_start_post;
+        TransientExecCommandItem *exec_start_pre;
+        size_t n_exec_start_pre;
+        TransientExecCommandItem *exec_stop;
+        size_t n_exec_stop;
+        TransientExecCommandItem *exec_stop_post;
+        size_t n_exec_stop_post;
 } TransientServiceParameters;
 
-static void transient_service_parameters_done(TransientServiceParameters *p) {
-        assert(p);
-        FOREACH_ARRAY(i, p->exec_start, p->n_exec_start)
+static void transient_exec_command_list_free(TransientExecCommandItem *items, size_t n) {
+        FOREACH_ARRAY(i, items, n)
                 transient_exec_command_item_done(i);
-        free(p->exec_start);
+        free(items);
 }
 
-static int dispatch_transient_exec_command(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+/* Defined below alongside service_properties[]; the body iterates the table calling per-property
+ * cleanup hooks so adding a new resource-owning property never requires touching this function. */
+static void transient_service_parameters_done(TransientServiceParameters *p);
+
+static int dispatch_transient_exec_command_into(
+                sd_json_variant *variant,
+                sd_json_dispatch_flags_t flags,
+                const char *json_name,
+                TransientExecCommandItem **ret_items,
+                size_t *ret_n) {
+
         static const sd_json_dispatch_field exec_command_dispatch[] = {
                 { "path",      SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, offsetof(TransientExecCommandItem, path),      SD_JSON_MANDATORY },
                 { "arguments", SD_JSON_VARIANT_ARRAY,  sd_json_dispatch_strv,         offsetof(TransientExecCommandItem, arguments), 0                 },
                 {}
         };
 
-        TransientServiceParameters *p = ASSERT_PTR(userdata);
         size_t n;
         int r;
 
+        assert(ret_items);
+        assert(ret_n);
+
         if (!sd_json_variant_is_array(variant))
-                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Expected JSON array for ExecStart.");
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Expected JSON array for %s.", json_name);
 
         n = sd_json_variant_elements(variant);
         if (n == 0)
                 return 0;
 
-        p->exec_start = new0(TransientExecCommandItem, n);
-        if (!p->exec_start)
+        TransientExecCommandItem *items = new0(TransientExecCommandItem, n);
+        if (!items)
                 return -ENOMEM;
-        p->n_exec_start = n;
 
         for (size_t i = 0; i < n; i++) {
                 sd_json_variant *element = sd_json_variant_by_index(variant, i);
 
-                r = sd_json_dispatch(element, exec_command_dispatch, /* flags= */ 0, &p->exec_start[i]);
-                if (r < 0)
+                r = sd_json_dispatch(element, exec_command_dispatch, /* flags= */ 0, &items[i]);
+                if (r < 0) {
+                        transient_exec_command_list_free(items, i);
                         return r;
+                }
         }
+
+        *ret_items = items;
+        *ret_n = n;
         return 0;
 }
 
@@ -928,19 +965,8 @@ static int dispatch_transient_set_credential_encrypted(const char *name, sd_json
 }
 
 static int dispatch_transient_exec_context(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
-
-static int dispatch_transient_service(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
-        static const sd_json_dispatch_field service_dispatch[] = {
-                { "Type",            SD_JSON_VARIANT_STRING,  dispatch_service_type,           offsetof(TransientServiceParameters, type),              0 },
-                { "ExecStart",       SD_JSON_VARIANT_ARRAY,   dispatch_transient_exec_command, 0,                                                       0 },
-                { "RemainAfterExit", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,       offsetof(TransientServiceParameters, remain_after_exit), 0 },
-                {}
-        };
-
-        StartTransientContextParameters *p = ASSERT_PTR(userdata);
-        p->service.present = true;
-        return sd_json_dispatch_full(variant, service_dispatch, /* bad= */ NULL, /* flags= */ 0, &p->service, &p->bad_service_field);
-}
+/* Defined below alongside the service_properties[] table it iterates. */
+static int dispatch_transient_service(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 
 static int dispatch_transient_context(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field context_dispatch[] = {
@@ -1415,31 +1441,31 @@ static int transient_exec_context_apply_properties(Unit *u, ExecContext *c, Tran
         return 0;
 }
 
-static int transient_service_apply_properties(Service *s, TransientServiceParameters *sp, const char **reterr_field) {
-        Unit *u = UNIT(ASSERT_PTR(s));
+/* Append parsed ExecCommand items to s->exec_command[kind] and write the matching "<JsonName>=…" lines.
+ * Returns 0 on success or no-op (empty list), -EINVAL on bad path, -ENOMEM on allocation failure. */
+static int transient_apply_exec_command_list(
+                Unit *u,
+                Service *s,
+                const TransientExecCommandItem *items,
+                size_t n,
+                ServiceExecCommand kind,
+                const char *json_name) {
+
         int r;
 
-        assert(sp);
+        assert(u);
+        assert(s);
+        assert(json_name);
 
-        if (sp->type >= 0) {
-                s->type = sp->type;
-                unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, "Type", "Type=%s", service_type_to_string(sp->type));
-        }
+        if (n == 0)
+                return 0;
 
-        if (sp->remain_after_exit >= 0) {
-                s->remain_after_exit = sp->remain_after_exit;
-                unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, "RemainAfterExit", "RemainAfterExit=%s", yes_no(sp->remain_after_exit));
-        }
-
-        FOREACH_ARRAY(item, sp->exec_start, sp->n_exec_start) {
+        FOREACH_ARRAY(item, items, n) {
                 _cleanup_(exec_command_freep) ExecCommand *c = NULL;
                 _cleanup_strv_free_ char **argv = NULL;
 
-                if (!filename_or_absolute_path_is_valid(item->path)) {
-                        if (reterr_field)
-                                *reterr_field = "Service.ExecStart";
-                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid ExecStart path: %s", item->path);
-                }
+                if (!filename_or_absolute_path_is_valid(item->path))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid %s path: %s", json_name, item->path);
 
                 if (!strv_isempty(item->arguments)) {
                         argv = strv_copy(item->arguments);
@@ -1465,33 +1491,187 @@ static int transient_service_apply_properties(Service *s, TransientServiceParame
 
                 c->argv = TAKE_PTR(argv);
 
-                exec_command_append_list(&s->exec_command[SERVICE_EXEC_START], TAKE_PTR(c));
+                exec_command_append_list(&s->exec_command[kind], TAKE_PTR(c));
         }
 
-        /* Write ExecStart= lines to the transient file */
-        if (sp->n_exec_start > 0) {
-                UnitWriteFlags esc_flags = UNIT_ESCAPE_SPECIFIERS|UNIT_ESCAPE_EXEC_SYNTAX_ENV;
+        /* Write "<JsonName>=…" lines to the transient file. */
+        UnitWriteFlags esc_flags = UNIT_ESCAPE_SPECIFIERS|UNIT_ESCAPE_EXEC_SYNTAX_ENV;
 
-                LIST_FOREACH(command, c, s->exec_command[SERVICE_EXEC_START]) {
-                        _cleanup_free_ char *a = NULL;
+        LIST_FOREACH(command, c, s->exec_command[kind]) {
+                _cleanup_free_ char *a = NULL;
 
-                        a = unit_concat_strv(c->argv, esc_flags);
-                        if (!a)
+                a = unit_concat_strv(c->argv, esc_flags);
+                if (!a)
+                        return -ENOMEM;
+
+                /* streq() instead path_equal() as argv[0] can be arbitrary and may not be a path */
+                if (streq(c->path, c->argv[0]))
+                        unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, json_name, "%s=%s", json_name, a);
+                else {
+                        _cleanup_free_ char *t = NULL;
+                        const char *p;
+
+                        p = unit_escape_setting(c->path, esc_flags, &t);
+                        if (!p)
                                 return -ENOMEM;
 
-                        /* streq() instead path_equal() as argv[0] can be arbitrary and may not be a path */
-                        if (streq(c->path, c->argv[0]))
-                                unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, "ExecStart", "ExecStart=%s", a);
-                        else {
-                                _cleanup_free_ char *t = NULL;
-                                const char *p;
+                        unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, json_name, "%s=@%s %s", json_name, p, a);
+                }
+        }
 
-                                p = unit_escape_setting(c->path, esc_flags, &t);
-                                if (!p)
-                                        return -ENOMEM;
+        return 0;
+}
 
-                                unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, "ExecStart", "ExecStart=@%s %s", p, a);
-                        }
+/* Single-source-of-truth for an Exec* command-list property: generates the JSON dispatch wrapper,
+ * the apply fn that appends to s->exec_command[kind] and writes the unit-file lines, and a cleanup
+ * fn for the parsed items. All three are registered together via SERVICE_PROPERTY_EXEC_LIST so a
+ * new Exec* property cannot ship without parse, apply, AND free. */
+#define DEFINE_SERVICE_EXEC_LIST(field, kind, JsonName)                                                         \
+        static int dispatch_transient_##field(                                                                  \
+                        const char *name,                                                                       \
+                        sd_json_variant *variant,                                                               \
+                        sd_json_dispatch_flags_t flags,                                                         \
+                        void *userdata) {                                                                       \
+                TransientServiceParameters *p = ASSERT_PTR(userdata);                                           \
+                return dispatch_transient_exec_command_into(variant, flags, JsonName, &p->field, &p->n_##field); \
+        }                                                                                                       \
+        static int apply_service_##field(Unit *u, Service *s, TransientServiceParameters *p) {                  \
+                return transient_apply_exec_command_list(u, s, p->field, p->n_##field, kind, JsonName);         \
+        }                                                                                                       \
+        static void cleanup_##field(TransientServiceParameters *p) {                                            \
+                transient_exec_command_list_free(p->field, p->n_##field);                                       \
+        }
+
+DEFINE_SERVICE_EXEC_LIST(exec_condition,  SERVICE_EXEC_CONDITION,  "ExecCondition");
+DEFINE_SERVICE_EXEC_LIST(exec_reload,     SERVICE_EXEC_RELOAD,     "ExecReload");
+DEFINE_SERVICE_EXEC_LIST(exec_start,      SERVICE_EXEC_START,      "ExecStart");
+DEFINE_SERVICE_EXEC_LIST(exec_start_post, SERVICE_EXEC_START_POST, "ExecStartPost");
+DEFINE_SERVICE_EXEC_LIST(exec_start_pre,  SERVICE_EXEC_START_PRE,  "ExecStartPre");
+DEFINE_SERVICE_EXEC_LIST(exec_stop,       SERVICE_EXEC_STOP,       "ExecStop");
+DEFINE_SERVICE_EXEC_LIST(exec_stop_post,  SERVICE_EXEC_STOP_POST,  "ExecStopPost");
+
+/* Apply fn for a Service tristate bool: copy parsed value, write "Name=yes/no", skip if absent. */
+#define DEFINE_APPLY_SERVICE_TRISTATE_BOOL(field, JsonName)             \
+        static int apply_service_##field(Unit *u, Service *s, TransientServiceParameters *p) { \
+                if (p->field < 0)                                       \
+                        return 0;                                       \
+                s->field = p->field;                                    \
+                unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, JsonName, \
+                                    JsonName "=%s", yes_no(p->field));  \
+                return 0;                                               \
+        }
+
+DEFINE_APPLY_SERVICE_TRISTATE_BOOL(guess_main_pid,     "GuessMainPID");
+DEFINE_APPLY_SERVICE_TRISTATE_BOOL(remain_after_exit,  "RemainAfterExit");
+
+/* Apply fn for a Service enum: copy parsed value, write "Name=<enum-string>", skip if absent
+ * (enum value is a negative _INVALID sentinel). */
+#define DEFINE_APPLY_SERVICE_ENUM(field, JsonName, to_string_fn)        \
+        static int apply_service_##field(Unit *u, Service *s, TransientServiceParameters *p) { \
+                if (p->field < 0)                                       \
+                        return 0;                                       \
+                s->field = p->field;                                    \
+                unit_write_settingf(u, UNIT_RUNTIME|UNIT_PRIVATE, JsonName, \
+                                    JsonName "=%s", to_string_fn(p->field)); \
+                return 0;                                               \
+        }
+
+DEFINE_APPLY_SERVICE_ENUM(notify_access, "NotifyAccess", notify_access_to_string);
+DEFINE_APPLY_SERVICE_ENUM(oom_policy,    "OOMPolicy",    oom_policy_to_string);
+DEFINE_APPLY_SERVICE_ENUM(restart,       "Restart",      service_restart_to_string);
+DEFINE_APPLY_SERVICE_ENUM(restart_mode,  "RestartMode",  service_restart_mode_to_string);
+DEFINE_APPLY_SERVICE_ENUM(type,          "Type",         service_type_to_string);
+
+/* Per-property descriptor for fields of the Service object. Mirror of TransientExecProperty, plus
+ * an optional cleanup hook for properties that own allocated memory (Exec* command lists today). */
+typedef struct TransientServiceProperty {
+        const char *json_name;
+        const char *err_field;
+        sd_json_variant_type_t json_type;
+        sd_json_dispatch_callback_t dispatch;
+        size_t parse_offset;
+        sd_json_dispatch_flags_t json_flags;
+        int (*apply)(Unit *u, Service *s, TransientServiceParameters *p);
+        void (*cleanup)(TransientServiceParameters *p);   /* NULL = property owns no allocations */
+} TransientServiceProperty;
+
+/* Generic shape; use the specialized macros below when one fits. */
+#define SERVICE_PROPERTY(json, type, dispatch_fn, parse_offset, json_flags, apply_fn) \
+        { json, "Service." json, type, dispatch_fn, parse_offset, json_flags, apply_fn, NULL }
+
+/* Exec* command-list property: dispatch/apply/cleanup all generated by DEFINE_SERVICE_EXEC_LIST. */
+#define SERVICE_PROPERTY_EXEC_LIST(json, field)                                                  \
+        { json, "Service." json, SD_JSON_VARIANT_ARRAY, dispatch_transient_##field, 0, 0,        \
+          apply_service_##field, cleanup_##field }
+
+/* Tristate-bool property: parsed via sd_json_dispatch_tristate into an int (-1 = absent). */
+#define SERVICE_PROPERTY_TRISTATE_BOOL(json, field)                                              \
+        { json, "Service." json, SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,             \
+          offsetof(TransientServiceParameters, field), 0, apply_service_##field, NULL }
+
+/* Enum property: parsed via a dedicated string-to-enum dispatcher (e.g. dispatch_service_type). */
+#define SERVICE_PROPERTY_ENUM(json, dispatch_fn, field)                                          \
+        { json, "Service." json, SD_JSON_VARIANT_STRING, dispatch_fn,                            \
+          offsetof(TransientServiceParameters, field), 0, apply_service_##field, NULL }
+
+static const TransientServiceProperty service_properties[] = {
+        SERVICE_PROPERTY_EXEC_LIST    ("ExecCondition",   exec_condition),
+        SERVICE_PROPERTY_EXEC_LIST    ("ExecReload",      exec_reload),
+        SERVICE_PROPERTY_EXEC_LIST    ("ExecStart",       exec_start),
+        SERVICE_PROPERTY_EXEC_LIST    ("ExecStartPost",   exec_start_post),
+        SERVICE_PROPERTY_EXEC_LIST    ("ExecStartPre",    exec_start_pre),
+        SERVICE_PROPERTY_EXEC_LIST    ("ExecStop",        exec_stop),
+        SERVICE_PROPERTY_EXEC_LIST    ("ExecStopPost",    exec_stop_post),
+        SERVICE_PROPERTY_TRISTATE_BOOL("GuessMainPID",    guess_main_pid),
+        SERVICE_PROPERTY_ENUM         ("NotifyAccess",    dispatch_notify_access,        notify_access),
+        SERVICE_PROPERTY_ENUM         ("OOMPolicy",       dispatch_oom_policy,           oom_policy),
+        SERVICE_PROPERTY_TRISTATE_BOOL("RemainAfterExit", remain_after_exit),
+        SERVICE_PROPERTY_ENUM         ("Restart",         dispatch_service_restart,      restart),
+        SERVICE_PROPERTY_ENUM         ("RestartMode",     dispatch_service_restart_mode, restart_mode),
+        SERVICE_PROPERTY_ENUM         ("Type",            dispatch_service_type,         type),
+};
+#undef SERVICE_PROPERTY
+#undef SERVICE_PROPERTY_EXEC_LIST
+#undef SERVICE_PROPERTY_TRISTATE_BOOL
+#undef SERVICE_PROPERTY_ENUM
+
+/* Real definition of the forward-declared done(): walks the table calling registered cleanup
+ * hooks. Adding a new resource-owning Service property never needs to touch this body. */
+static void transient_service_parameters_done(TransientServiceParameters *p) {
+        assert(p);
+        FOREACH_ELEMENT(prop, service_properties)
+                if (prop->cleanup)
+                        prop->cleanup(p);
+}
+
+static int dispatch_transient_service(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        sd_json_dispatch_field service_dispatch[ELEMENTSOF(service_properties) + 1] = {};
+
+        FOREACH_ELEMENT(prop, service_properties)
+                service_dispatch[prop - service_properties] = (sd_json_dispatch_field) {
+                        .name = prop->json_name,
+                        .type = prop->json_type,
+                        .callback = prop->dispatch,
+                        .offset = prop->parse_offset,
+                        .flags = prop->json_flags,
+                };
+
+        StartTransientContextParameters *p = ASSERT_PTR(userdata);
+        p->service.present = true;
+        return sd_json_dispatch_full(variant, service_dispatch, /* bad= */ NULL, /* flags= */ 0, &p->service, &p->bad_service_field);
+}
+
+static int transient_service_apply_properties(Service *s, TransientServiceParameters *sp, const char **reterr_field) {
+        Unit *u = UNIT(ASSERT_PTR(s));
+
+        assert(sp);
+
+        FOREACH_ELEMENT(prop, service_properties) {
+                int r = prop->apply(u, s, sp);
+                if (r < 0) {
+                        if (r == -EINVAL && reterr_field)
+                                *reterr_field = prop->err_field;
+                        return r;
                 }
         }
 
@@ -1513,7 +1693,12 @@ int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters
                 .notify_job_changes = -1,
                 .notify_unit_changes = -1,
                 .context.service.type = _SERVICE_TYPE_INVALID,
+                .context.service.restart = _SERVICE_RESTART_INVALID,
+                .context.service.restart_mode = _SERVICE_RESTART_MODE_INVALID,
+                .context.service.notify_access = _NOTIFY_ACCESS_INVALID,
+                .context.service.oom_policy = _OOM_POLICY_INVALID,
                 .context.service.remain_after_exit = -1,
+                .context.service.guess_main_pid = -1,
         };
         transient_exec_context_parameters_init(&p.context.exec);
         Manager *manager = ASSERT_PTR(userdata);
