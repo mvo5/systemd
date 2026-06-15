@@ -1,0 +1,36 @@
+#  SPDX-License-Identifier: LGPL-2.1-or-later
+#
+#  This file is part of systemd.
+#
+#  systemd is free software; you can redistribute it and/or modify it
+#  under the terms of the GNU Lesser General Public License as published by
+#  the Free Software Foundation; either version 2.1 of the License, or
+#  (at your option) any later version.
+
+[Unit]
+Description=Varlink SFTP Server
+Documentation=man:varlinkctl(1)
+DefaultDependencies=no
+
+[Service]
+Type=notify
+ExecStart=varlinkctl serve io.systemd.Sftp.Connect {{SFTP_SERVER}}
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+
+# The server runs as root and serves the whole filesystem by default. To turn it
+# into a confined file-access broker, run it as a dedicated user and scope it to
+# a subtree, e.g.:
+# User=sftp
+# DynamicUser=yes
+# RootDirectory=/srv/sftp
+# BindPaths=/srv/sftp/data

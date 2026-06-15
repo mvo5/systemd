@@ -974,6 +974,14 @@ units = [
         { 'file' : 'user.slice' },
         { 'file' : 'user@.service.in' },
         {
+          'file' : 'varlink-sftp.service.in',
+          'conditions' : ['ENABLE_VARLINK_SFTP'],
+        },
+        {
+          'file' : 'varlink-sftp.socket',
+          'conditions' : ['ENABLE_VARLINK_SFTP'],
+        },
+        {
           'file' : 'var-lib-machines.mount',
           'conditions' : ['ENABLE_MACHINED'],
           'symlinks' : ['remote-fs.target.wants/', 'machines.target.wants/'],
