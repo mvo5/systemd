@@ -1,8 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /*
- * Detect pointer parameters that are dereferenced without a prior NULL check
- * or assertion. In systemd style, non-optional pointer parameters should have
- * an assert() at the top of the function.
+ * Detect pointer parameters that are dereferenced via *param (prefix
+ * dereference) without a prior NULL check or assertion. In systemd style,
+ * non-optional pointer parameters should have an assert() at the top of the
+ * function.
+ *
+ * param->field dereferences are checked separately, in
+ * check-pointer-deref-2.cocci: "->" is ubiquitous and the flow-sensitive scan
+ * used here suffers a CTL state-explosion on large, dereference-dense functions,
+ * so that check uses a cheaper flow-insensitive approach. Prefix dereferences
+ * are rare, so the flow-sensitive scan below stays cheap.
  *
  * Usage:
  *   spatch --sp-file coccinelle/check-pointer-deref.cocci --dir src/boot/
@@ -23,6 +30,8 @@ fn(..., T *param, ...) {
       when != assert(param != NULL)
       when != assert_se(param)
       when != assert_se(param != NULL)
+      when != assert_raw(param)
+      when != assert_raw(param != NULL)
       when != assert_return(param, ...)
       when != ASSERT_PTR(param)
       when != POINTER_MAY_BE_NULL(param)

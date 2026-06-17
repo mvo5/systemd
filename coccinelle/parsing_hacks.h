@@ -104,6 +104,12 @@
  * false positives from check-pointer-deref.cocci. See assert-util.h for the definition. */
 #define SIZEOF(x) 8
 
+/* _unlikely_()/_likely_() wrap their argument in __builtin_expect(). Without
+ * unwrapping them, coccinelle can't see NULL checks like "if (_unlikely_(!p))",
+ * which causes false positives in check-pointer-deref.cocci. */
+#define _unlikely_(x) (x)
+#define _likely_(x) (x)
+
 /* Work around a bug in zlib.h parsing on Fedora (and possibly others)
  * See: https://github.com/coccinelle/coccinelle/issues/413 */
 #define Z_EXPORT
