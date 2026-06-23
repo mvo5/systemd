@@ -15,7 +15,7 @@ project('systemd', 'c',
 
 add_test_setup(
         'default',
-        exclude_suites : ['clang-tidy', 'coccinelle', 'unused-symbols', 'integration-tests'],
+        exclude_suites : ['clang-tidy', 'coccinelle', 'tree-sitter', 'unused-symbols', 'integration-tests'],
         exe_wrapper : find_program('tools/test-crash-trace.sh'),
         is_default : true,
 )
@@ -2651,6 +2651,41 @@ if spatch.found()
                                 args : [meson.project_source_root() / dir,
                                         meson.project_source_root() / 'coccinelle'],
                                 suite : 'coccinelle',
+                                timeout : 120,
+                        )
+                endif
+        endforeach
+endif
+
+# Tree-sitter based pointer-deref check: companion to the coccinelle check above,
+# additionally covering `param->field` and `param[i]` dereferences, which are too
+# slow for coccinelle's flow-sensitive engine. Requires the python tree-sitter
+# bindings; skipped when unavailable, just like coccinelle is skipped without spatch.
+have_tree_sitter = run_command(
+        python, '-c', 'import tree_sitter, tree_sitter_c',
+        check : false,
+).returncode() == 0
+if have_tree_sitter
+        tree_sitter_exclude = [
+                # libc/ has no assert() or systemd-headers so leave it
+                'src/libc/',
+                # test/ has some deliberate wonky pointers, just leave excluded
+                'src/test/',
+        ]
+
+        tree_sitter_src_dirs = run_command(
+                'sh', '-c', 'printf "%s\n" src/*/',
+                check : true,
+        ).stdout().strip().split('\n')
+
+        foreach dir : tree_sitter_src_dirs
+                if dir not in tree_sitter_exclude
+                        test(
+                                'tree-sitter-@0@'.format(fs.name(dir.strip('/'))),
+                                python,
+                                args : [check_pointer_deref_py,
+                                        meson.project_source_root() / dir],
+                                suite : 'tree-sitter',
                                 timeout : 120,
                         )
                 endif
