@@ -16,6 +16,7 @@
 #include "json-util.h"
 #include "locale-util.h"
 #include "manager.h"
+#include "parse-util.h"
 #include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
@@ -713,6 +714,13 @@ typedef struct TransientExecContextParameters {
         int lock_personality;
         int memory_deny_write_execute;
         int no_new_privileges;
+        int private_devices;
+        int private_ipc;
+        int private_network;
+        int protect_clock;
+        int protect_kernel_logs;
+        int protect_kernel_modules;
+        int protect_kernel_tunables;
         int remove_ipc;
         int restrict_realtime;
         int restrict_suid_sgid;
@@ -879,6 +887,19 @@ DEFINE_TRANSIENT_EXEC_SETTABLE(environment,      sd_json_dispatch_strv);
 DEFINE_TRANSIENT_EXEC_SETTABLE(nice,             sd_json_dispatch_int32);
 DEFINE_TRANSIENT_EXEC_SETTABLE(oom_score_adjust, sd_json_dispatch_int32);
 DEFINE_TRANSIENT_EXEC_SETTABLE(umask,            sd_json_dispatch_uint32);
+
+/* For bools that are declared as strings in the varlink IDL (ProtectClock, ProtectKernel*,
+ * Private*), matching their "yes"/"no" serialization on Unit.List output. */
+static int dispatch_transient_bool_string(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        int *tristate = ASSERT_PTR(userdata), r;
+
+        r = parse_boolean(sd_json_variant_string(variant));
+        if (r < 0)
+                return json_log(variant, flags, r, "JSON field '%s' does not contain a boolean string.", strna(name));
+
+        *tristate = r;
+        return 0;
+}
 
 static int dispatch_transient_set_credential_array(
                 sd_json_variant *variant,
@@ -1215,6 +1236,13 @@ DEFINE_APPLY_EXEC_TRISTATE_BOOL(ignore_sigpipe,            "IgnoreSIGPIPE");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(lock_personality,          "LockPersonality");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(memory_deny_write_execute, "MemoryDenyWriteExecute");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(no_new_privileges,         "NoNewPrivileges");
+DEFINE_APPLY_EXEC_TRISTATE_BOOL(private_devices,           "PrivateDevices");
+DEFINE_APPLY_EXEC_TRISTATE_BOOL(private_ipc,               "PrivateIPC");
+DEFINE_APPLY_EXEC_TRISTATE_BOOL(private_network,           "PrivateNetwork");
+DEFINE_APPLY_EXEC_TRISTATE_BOOL(protect_clock,             "ProtectClock");
+DEFINE_APPLY_EXEC_TRISTATE_BOOL(protect_kernel_logs,       "ProtectKernelLogs");
+DEFINE_APPLY_EXEC_TRISTATE_BOOL(protect_kernel_modules,    "ProtectKernelModules");
+DEFINE_APPLY_EXEC_TRISTATE_BOOL(protect_kernel_tunables,   "ProtectKernelTunables");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(remove_ipc,                "RemoveIPC");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(restrict_realtime,         "RestrictRealtime");
 DEFINE_APPLY_EXEC_TRISTATE_BOOL(restrict_suid_sgid,        "RestrictSUIDSGID");
@@ -1346,6 +1374,11 @@ typedef struct TransientExecProperty {
         { json, "Exec." json, SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,      \
           offsetof(TransientExecContextParameters, field), 0, apply_exec_##field }
 
+/* Bool declared as a string in the varlink IDL, parsed into a tristate int. */
+#define EXEC_PROPERTY_BOOL_STRING(json, field)                                            \
+        { json, "Exec." json, SD_JSON_VARIANT_STRING, dispatch_transient_bool_string,     \
+          offsetof(TransientExecContextParameters, field), 0, apply_exec_##field, true }
+
 static const TransientExecProperty exec_properties[] = {
         EXEC_PROPERTY              ("WorkingDirectory",       SD_JSON_VARIANT_OBJECT,        dispatch_transient_working_directory,        0,                                                                       0,             apply_exec_working_directory),
         EXEC_PROPERTY_ABSOLUTE_PATH("RootDirectory",          root_directory),
@@ -1364,9 +1397,16 @@ static const TransientExecProperty exec_properties[] = {
         EXEC_PROPERTY              ("OOMScoreAdjust",         SD_JSON_VARIANT_INTEGER,       dispatch_transient_oom_score_adjust,         0,                                                                       0,             apply_exec_oom_score_adjust),
         EXEC_PROPERTY_TRISTATE_BOOL("IgnoreSIGPIPE",          ignore_sigpipe),
         EXEC_PROPERTY              ("Nice",                   SD_JSON_VARIANT_INTEGER,       dispatch_transient_nice,                     0,                                                                       0,             apply_exec_nice),
+        EXEC_PROPERTY_BOOL_STRING  ("PrivateDevices",         private_devices),
+        EXEC_PROPERTY_BOOL_STRING  ("PrivateNetwork",         private_network),
         EXEC_PROPERTY_ABSOLUTE_PATH("NetworkNamespacePath",   network_namespace_path),
+        EXEC_PROPERTY_BOOL_STRING  ("PrivateIPC",             private_ipc),
         EXEC_PROPERTY_ABSOLUTE_PATH("IPCNamespacePath",       ipc_namespace_path),
         EXEC_PROPERTY_ABSOLUTE_PATH("UserNamespacePath",      user_namespace_path),
+        EXEC_PROPERTY_BOOL_STRING  ("ProtectClock",           protect_clock),
+        EXEC_PROPERTY_BOOL_STRING  ("ProtectKernelTunables",  protect_kernel_tunables),
+        EXEC_PROPERTY_BOOL_STRING  ("ProtectKernelModules",   protect_kernel_modules),
+        EXEC_PROPERTY_BOOL_STRING  ("ProtectKernelLogs",      protect_kernel_logs),
         EXEC_PROPERTY_TRISTATE_BOOL("LockPersonality",        lock_personality),
         EXEC_PROPERTY_TRISTATE_BOOL("MemoryDenyWriteExecute", memory_deny_write_execute),
         EXEC_PROPERTY_TRISTATE_BOOL("RestrictRealtime",       restrict_realtime),
@@ -1380,6 +1420,7 @@ static const TransientExecProperty exec_properties[] = {
 #undef EXEC_PROPERTY_TRISTATE_BOOL
 #undef EXEC_PROPERTY_STRING
 #undef EXEC_PROPERTY_ABSOLUTE_PATH
+#undef EXEC_PROPERTY_BOOL_STRING
 
 /* Tristate-bool fields default to -1 (= absent). Default-zeroed slots would look "explicitly false"
  * to the apply path. Initialize all tristate fields here so adding a new tristate property only

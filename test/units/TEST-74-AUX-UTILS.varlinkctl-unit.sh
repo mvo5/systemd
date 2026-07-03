@@ -264,6 +264,25 @@ test -n "$fragment"
 grep '^RootHash=/etc/hostname$'          "$fragment" >/dev/null
 grep '^RootHashSignature=/etc/machine-id$' "$fragment" >/dev/null
 
+# Sandbox bools declared as strings in the IDL ("yes"/"no"): PrivateDevices, PrivateNetwork,
+# PrivateIPC, ProtectClock, ProtectKernelTunables, ProtectKernelModules, ProtectKernelLogs
+defer_transient_cleanup varlink-transient-sandbox.service
+result=$(varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.StartTransient \
+    '{"context":{"ID":"varlink-transient-sandbox.service","Exec":{"PrivateDevices":"yes","PrivateNetwork":"yes","PrivateIPC":"yes","ProtectClock":"yes","ProtectKernelTunables":"yes","ProtectKernelModules":"yes","ProtectKernelLogs":"no"},"Service":{"Type":"oneshot","RemainAfterExit":true,"ExecStart":[{"path":"/bin/true"}]}}}')
+echo "$result" | jq -e '.context.Exec.PrivateDevices == "yes"'
+echo "$result" | jq -e '.context.Exec.PrivateNetwork == "yes"'
+echo "$result" | jq -e '.context.Exec.PrivateIPC == "yes"'
+echo "$result" | jq -e '.context.Exec.ProtectClock == "yes"'
+echo "$result" | jq -e '.context.Exec.ProtectKernelLogs == "no"'
+timeout 30 bash -c 'until systemctl is-active varlink-transient-sandbox.service; do sleep 0.5; done'
+systemctl show -P PrivateDevices varlink-transient-sandbox.service | grep '^yes$' >/dev/null
+systemctl show -P PrivateNetwork varlink-transient-sandbox.service | grep '^yes$' >/dev/null
+systemctl show -P PrivateIPC varlink-transient-sandbox.service | grep '^yes$' >/dev/null
+systemctl show -P ProtectClock varlink-transient-sandbox.service | grep '^yes$' >/dev/null
+systemctl show -P ProtectKernelTunables varlink-transient-sandbox.service | grep '^yes$' >/dev/null
+systemctl show -P ProtectKernelModules varlink-transient-sandbox.service | grep '^yes$' >/dev/null
+systemctl show -P ProtectKernelLogs varlink-transient-sandbox.service | grep '^no$' >/dev/null
+
 # Error cases: verify specific varlink error types
 set +o pipefail
 varlinkctl call "$MANAGER_SOCKET" io.systemd.Unit.StartTransient \
@@ -319,6 +338,11 @@ defer_transient_cleanup varlink-transient-bad-rd.service
 expect_invalid_parameter \
     '{"context":{"ID":"varlink-transient-bad-rd.service","Exec":{"RootDirectory":"relative/path"},"Service":{"Type":"oneshot","ExecStart":[{"path":"/bin/true"}]}}}' \
     "Exec.RootDirectory"
+# Non-boolean string for a sandbox bool is rejected at JSON dispatch time as a parameter error
+defer_transient_cleanup varlink-transient-bad-bool.service
+expect_invalid_parameter \
+    '{"context":{"ID":"varlink-transient-bad-bool.service","Exec":{"ProtectClock":"maybe"},"Service":{"Type":"oneshot","ExecStart":[{"path":"/bin/true"}]}}}' \
+    "context"
 # Invalid credential ID
 defer_transient_cleanup varlink-transient-bad-cred-id.service
 expect_invalid_parameter \
