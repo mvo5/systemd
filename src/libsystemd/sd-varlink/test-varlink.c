@@ -18,6 +18,7 @@
 #include "json-util.h"
 #include "memfd-util.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "rm-rf.h"
 #include "socket-util.h"
 #include "string-util.h"
@@ -423,6 +424,49 @@ static int reply_invalid(sd_varlink *link, sd_json_variant *parameters, const ch
         ASSERT_TRUE(sd_varlink_error_is_invalid_parameter(error_id, parameters, "idontexist"));
         ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
         return 0;
+}
+
+TEST(peer_name) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, 0));
+
+        _cleanup_free_ char *listener_name = NULL, *tag_name = NULL;
+        ASSERT_OK(asprintf(&listener_name, "@test-varlink-peer-name-" PID_FMT, getpid()));
+        ASSERT_OK(asprintf(&tag_name, "@%016" PRIx64 "/caller-tag/test", (uint64_t) getpid()));
+
+        union sockaddr_union listener_sa, tag_sa;
+        ASSERT_OK(sockaddr_un_set_path(&listener_sa.un, listener_name));
+        ASSERT_OK(sockaddr_un_set_path(&tag_sa.un, tag_name));
+
+        _cleanup_close_ int listener = ASSERT_FD(socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0));
+        ASSERT_OK_ERRNO(bind(listener, &listener_sa.sa, sockaddr_len(&listener_sa)));
+        ASSERT_OK_ERRNO(listen(listener, 1));
+
+        _cleanup_close_ int client = ASSERT_FD(socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0));
+        ASSERT_OK_ERRNO(bind(client, &tag_sa.sa, sockaddr_len(&tag_sa)));
+        ASSERT_OK_ERRNO(connect(client, &listener_sa.sa, sockaddr_len(&listener_sa)));
+
+        _cleanup_close_ int accepted = ASSERT_FD(accept4(listener, NULL, NULL, SOCK_NONBLOCK|SOCK_CLOEXEC));
+        _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
+        ASSERT_OK(sd_varlink_server_add_connection(s, accepted, &link));
+        TAKE_FD(accepted);
+        sd_varlink_ref(link);
+
+        /* Gone from the kernel now, so the server must have read it on accept */
+        client = safe_close(client);
+
+        const char *name;
+        ASSERT_OK(sd_varlink_get_peer_name(link, &name));
+        ASSERT_STREQ(name, tag_name + 1);
+
+        int pair[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, pair));
+        _cleanup_(sd_varlink_unrefp) sd_varlink *unnamed = NULL;
+        ASSERT_OK(sd_varlink_server_add_connection(s, pair[0], &unnamed));
+        sd_varlink_ref(unnamed);
+        pair[1] = safe_close(pair[1]);
+
+        ASSERT_ERROR(sd_varlink_get_peer_name(unnamed, &name), ENODATA);
 }
 
 TEST(invalid_parameter) {

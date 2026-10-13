@@ -136,6 +136,8 @@ static void json_stream_clear(JsonStream *s) {
 
         s->peer_pidfd = safe_close(s->peer_pidfd);
         s->ucred_acquired = false;
+        s->peer_name = mfree(s->peer_name);
+        s->peer_name_acquired = false;
         s->af = -1;
 
         close_many(s->input_fds, s->n_input_fds);
@@ -635,6 +637,44 @@ int json_stream_acquire_peer_pidfd(JsonStream *s) {
                 return json_stream_log_errno(s, s->peer_pidfd, "Failed to acquire pidfd of peer: %m");
 
         return s->peer_pidfd;
+}
+
+int json_stream_acquire_peer_name(JsonStream *s, const char **ret) {
+        assert(s);
+
+        if (!s->peer_name_acquired) {
+                union sockaddr_union sa;
+                socklen_t salen = sizeof(sa);
+
+                if (s->input_fd != s->output_fd)
+                        return json_stream_log_errno(s, SYNTHETIC_ERRNO(EBADF), "Failed to acquire name of peer: separate input/output fds");
+
+                if (getpeername(s->input_fd, &sa.sa, &salen) < 0)
+                        return json_stream_log_errno(s, errno, "Failed to acquire name of peer: %m");
+
+                if (sa.sa.sa_family == AF_UNIX &&
+                    salen > offsetof(struct sockaddr_un, sun_path) + 1 &&
+                    sa.un.sun_path[0] == 0) {
+                        /* Addressed through un_buffer[] for the same reason as in sockaddr_pretty() */
+                        const char *p = (const char*) sa.un_buffer + offsetof(struct sockaddr_un, sun_path) + 1;
+                        size_t l = salen - offsetof(struct sockaddr_un, sun_path) - 1;
+
+                        if (!memchr(p, 0, l)) {
+                                s->peer_name = memdup_suffix0(p, l);
+                                if (!s->peer_name)
+                                        return -ENOMEM;
+                        }
+                }
+
+                s->peer_name_acquired = true;
+        }
+
+        if (!s->peer_name)
+                return -ENODATA;
+
+        if (ret)
+                *ret = s->peer_name;
+        return 0;
 }
 
 static int json_stream_verify_unix_socket(JsonStream *s) {

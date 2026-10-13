@@ -736,6 +736,19 @@ static int varlink_check_good_user(sd_varlink *link, uid_t good_user, bool *ret_
         return good_user == peer_uid;
 }
 
+/* A proxy names its socket "<reference>/caller-tag/<provider>" so polkit can ask the provider who is
+ * really calling */
+static const char* varlink_peer_caller_tag(sd_varlink *link) {
+        const char *name;
+
+        assert(link);
+
+        if (sd_varlink_get_peer_name(link, &name) < 0)
+                return NULL;
+
+        return strstr(name, "/caller-tag/") ? name : NULL;
+}
+
 static int varlink_check_peer_privilege(sd_varlink *link) {
         int r;
 
@@ -790,13 +803,42 @@ static int bus_message_new_polkit_auth_call_for_varlink(
         if (r < 0)
                 return r;
 
+        r = sd_bus_message_open_container(c, 'r', "sa{sv}");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(c, "s", "unix-process");
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_open_container(c, 'a', "{sv}");
+        if (r < 0)
+                return r;
+
         r = sd_bus_message_append(
                         c,
-                        "(sa{sv})s",
-                        "unix-process", 2,
+                        "{sv}{sv}",
                         "pidfd", "h", (uint32_t) pidref.fd,
-                        "uid", "i", (int32_t) uid,
-                        action);
+                        "uid", "i", (int32_t) uid);
+        if (r < 0)
+                return r;
+
+        const char *tag = varlink_peer_caller_tag(link);
+        if (tag) {
+                r = sd_bus_message_append(c, "{sv}", "on-behalf-of", "s", tag);
+                if (r < 0)
+                        return r;
+        }
+
+        r = sd_bus_message_close_container(c);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_close_container(c);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_append(c, "s", action);
         if (r < 0)
                 return r;
 
@@ -861,15 +903,22 @@ int varlink_verify_polkit_async_full(
         /* This is the same as bus_verify_polkit_async_full(), but authenticates the peer of a varlink
          * connection rather than the sender of a bus message. */
 
-        r = varlink_check_good_user(link, good_user, &admin);
-        if (r != 0) {
-                if (r > 0 && ret_admin)
-                        *ret_admin = admin;
-                return r;
+        /* The peer's own uid says nothing about who it is calling for; only polkit can tell */
+        bool tagged = varlink_peer_caller_tag(link);
+
+        if (!tagged) {
+                r = varlink_check_good_user(link, good_user, &admin);
+                if (r != 0) {
+                        if (r > 0 && ret_admin)
+                                *ret_admin = admin;
+                        return r;
+                }
         }
 
 #if ENABLE_POLKIT
-        if (!FLAGS_SET(flags, POLKIT_ALWAYS_QUERY)) {
+        if (!tagged && !FLAGS_SET(flags, POLKIT_ALWAYS_QUERY)) {
+#else
+        if (!tagged) {
 #endif
                 r = varlink_check_peer_privilege(link);
                 if (r != 0) {
@@ -877,9 +926,9 @@ int varlink_verify_polkit_async_full(
                                 *ret_admin = true;
                         return r;
                 }
-#if ENABLE_POLKIT
         }
 
+#if ENABLE_POLKIT
         _cleanup_(async_polkit_query_unrefp) AsyncPolkitQuery *q = NULL;
 
         q = async_polkit_query_ref(hashmap_get(*registry, link));

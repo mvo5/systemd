@@ -249,6 +249,8 @@ int sd_varlink_get_peer_uid(sd_varlink *v, uid_t *ret);
 int sd_varlink_get_peer_gid(sd_varlink *v, gid_t *ret);
 int sd_varlink_get_peer_pid(sd_varlink *v, pid_t *ret);
 int sd_varlink_get_peer_pidfd(sd_varlink *v);
+/* The abstract AF_UNIX name of the peer without the leading NUL, -ENODATA if it has none */
+int sd_varlink_get_peer_name(sd_varlink *v, const char **ret);
 
 int sd_varlink_set_relative_timeout(sd_varlink *v, uint64_t timeout);
 

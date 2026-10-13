@@ -3010,6 +3010,13 @@ _public_ int sd_varlink_get_peer_pidfd(sd_varlink *v) {
         return json_stream_acquire_peer_pidfd(&v->stream);
 }
 
+_public_ int sd_varlink_get_peer_name(sd_varlink *v, const char **ret) {
+        assert_return(v, -EINVAL);
+        assert_return(ret, -EINVAL);
+
+        return json_stream_acquire_peer_name(&v->stream, ret);
+}
+
 _public_ int sd_varlink_set_relative_timeout(sd_varlink *v, uint64_t timeout) {
         assert_return(v, -EINVAL);
 
@@ -3450,6 +3457,10 @@ _public_ int sd_varlink_server_add_connection_pair(
                 sd_varlink_close(v);
                 return r;
         }
+
+        /* A one-way caller may be gone, and its name with it, before anyone asks */
+        if (input_fd == output_fd)
+                (void) json_stream_acquire_peer_name(&v->stream, /* ret= */ NULL);
 
         if (server->flags & SD_VARLINK_SERVER_INHERIT_USERDATA)
                 v->userdata = server->userdata;

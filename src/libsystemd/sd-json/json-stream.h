@@ -84,6 +84,8 @@ typedef struct JsonStream {
         struct ucred ucred;
         bool ucred_acquired;
         int peer_pidfd;
+        char *peer_name;
+        bool peer_name_acquired;
 
         /* Cached socket address family. -1 = unchecked, AF_UNSPEC = checked-not-socket,
          * otherwise the resolved family. */
@@ -246,6 +248,10 @@ int json_stream_acquire_peer_pid(JsonStream *s, pid_t *ret);
 int json_stream_acquire_peer_pidfd(JsonStream *s);
 int json_stream_get_peer_ucred(const JsonStream *s, struct ucred *ret);
 void json_stream_set_peer_ucred(JsonStream *s, const struct ucred *ucred);
+
+/* The abstract AF_UNIX name of the peer, -ENODATA if it has none. The kernel forgets it once the peer
+ * closes, so the server acquires it on accept. */
+int json_stream_acquire_peer_name(JsonStream *s, const char **ret);
 
 /* Per-operation idle timeout. The deadline is computed as last_activity + timeout.
  * Successful writes refresh last_activity automatically; the consumer should also call
