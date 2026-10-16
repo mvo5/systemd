@@ -48,10 +48,11 @@ static int bus_message_check_good_user(sd_bus_message *m, uid_t good_user, bool 
 }
 
 #if ENABLE_POLKIT
-static int bus_message_append_strv_key_value(sd_bus_message *m, const char **l) {
+static int bus_message_append_polkit_details(sd_bus_message *m, const char **l, const char *transport) {
         int r;
 
         assert(m);
+        assert(transport);
 
         r = sd_bus_message_open_container(m, 'a', "{ss}");
         if (r < 0)
@@ -62,6 +63,10 @@ static int bus_message_append_strv_key_value(sd_bus_message *m, const char **l) 
                 if (r < 0)
                         return r;
         }
+
+        r = sd_bus_message_append(m, "{ss}", "transport", transport);
+        if (r < 0)
+                return r;
 
         return sd_bus_message_close_container(m);
 }
@@ -99,7 +104,7 @@ static int bus_message_new_polkit_auth_call_for_bus(
         if (r < 0)
                 return r;
 
-        r = bus_message_append_strv_key_value(c, details);
+        r = bus_message_append_polkit_details(c, details, "dbus");
         if (r < 0)
                 return r;
 
@@ -800,7 +805,7 @@ static int bus_message_new_polkit_auth_call_for_varlink(
         if (r < 0)
                 return r;
 
-        r = bus_message_append_strv_key_value(c, details);
+        r = bus_message_append_polkit_details(c, details, "varlink");
         if (r < 0)
                 return r;
 
