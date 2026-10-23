@@ -50,6 +50,7 @@
 #include "runtime-scope.h"
 #include "socket-forward.h"
 #include "socket-util.h"
+#include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
@@ -633,24 +634,20 @@ static int dup_stdio_fd(int fd, int flags) {
 
         assert(fd >= 0);
 
-        /* SPLICE_F_NONBLOCK only covers the forwarder's internal pipe, hence stdin/stdout must be
-         * O_NONBLOCK themselves. Reopen (as ptyfwd does) so that the invoking shell's open file description
-         * is not switched to non-blocking too. Sockets cannot be reopened, hence the fallback. */
-        r = fd_reopen_propagate_append_and_position(fd, flags|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+        /* Regular files never block, keep the shared description and with it the shared file offset.
+         * Everything else is reopened (as ptyfwd does) so that the forwarder's O_NONBLOCK does not end up on
+         * the invoking shell's terminal or pipe. O_NONBLOCK on the reopen also keeps a FIFO from blocking
+         * until the other side shows up. Sockets cannot be reopened, hence the fallback. */
+        if (fd_verify_regular(fd) >= 0)
+                return RET_NERRNO(fcntl(fd, F_DUPFD_CLOEXEC, 3));
+
+        r = fd_reopen(fd, flags|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
         if (r >= 0)
                 return r;
 
         log_debug_errno(r, "Failed to reopen fd %i, using a dup instead: %m", fd);
 
-        _cleanup_close_ int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
-        if (dup_fd < 0)
-                return -errno;
-
-        r = fd_nonblock(dup_fd, true);
-        if (r < 0)
-                return r;
-
-        return TAKE_FD(dup_fd);
+        return RET_NERRNO(fcntl(fd, F_DUPFD_CLOEXEC, 3));
 }
 
 /* This will only return if something goes wrong, otherwise the exec_cmdline
@@ -845,15 +842,6 @@ static int varlink_call_and_upgrade(const char *url, const char *method, sd_json
         }
 
         /* No --exec: bidirectional proxy between stdin/stdout and the upgraded socket */
-
-        /* splice() into a socket honours the socket's O_NONBLOCK, not SPLICE_F_NONBLOCK. */
-        r = fd_nonblock(input_fd, true);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set upgraded input fd to non-blocking mode: %m");
-
-        r = fd_nonblock(output_fd, true);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set upgraded output fd to non-blocking mode: %m");
 
         /* Use a clean event loop just for the forwarding to avoid any interference. */
         r = sd_event_new(&event);
