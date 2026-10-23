@@ -827,44 +827,41 @@ int fd_reopen(int fd, int flags) {
         return new_fd;
 }
 
-int fd_reopen_propagate_append_and_position(int fd, int flags) {
-        /* Invokes fd_reopen(fd, flags), but propagates O_APPEND if set on original fd, and also tries to
-         * keep current file position.
-         *
-         * You should use this if the original fd potentially is O_APPEND, otherwise we get rather
-         * "unexpected" behavior. Unless you intentionally want to overwrite pre-existing data, and have
-         * your output overwritten by the next user.
-         *
-         * Use case: "systemd-run --pty >> some-log".
-         *
-         * The "keep position" part is obviously nonsense for the O_APPEND case, but should reduce surprises
-         * if someone carefully pre-positioned the passed in original input or non-append output FDs. */
+int fd_reopen_nonblock(int fd, int flags) {
+        struct stat st;
+        int r;
+
+        /* Returns a new fd for the same file with O_NONBLOCK set, for use from an event loop. Prefers a
+         * reopen so that other users of the original open file description (e.g. the invoking shell on its
+         * terminal) are not switched to non-blocking as well. Regular files never block and are duplicated
+         * instead: a private description would come with a private file offset, and whatever the shell
+         * writes to the same file after us would then clobber our output. Sockets cannot be reopened and are
+         * duplicated too, O_NONBLOCK then ends up on the shared description. */
 
         assert(fd >= 0);
-        assert(!(flags & (O_APPEND|O_DIRECTORY)));
+        assert(!(flags & (O_APPEND|O_DIRECTORY|O_NONBLOCK)));
 
-        int existing_flags = fcntl(fd, F_GETFL);
-        if (existing_flags < 0)
+        if (fstat(fd, &st) < 0)
                 return -errno;
 
-        int new_fd = fd_reopen(fd, flags | (existing_flags & O_APPEND));
-        if (new_fd < 0)
-                return new_fd;
+        if (S_ISREG(st.st_mode))
+                return RET_NERRNO(fcntl(fd, F_DUPFD_CLOEXEC, 3));
 
-        /* Try to adjust the offset, but ignore errors. */
-        off_t p = lseek(fd, 0, SEEK_CUR);
-        if (p > 0) {
-                off_t new_p = lseek(new_fd, p, SEEK_SET);
-                if (new_p < 0)
-                        log_debug_errno(errno,
-                                        "Failed to propagate file position for re-opened fd %d, ignoring: %m",
-                                        fd);
-                else if (new_p != p)
-                        log_debug("Failed to propagate file position for re-opened fd %d (%lld != %lld), ignoring.",
-                                  fd, (long long) new_p, (long long) p);
-        }
+        r = fd_reopen(fd, flags|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+        if (r >= 0)
+                return r;
 
-        return new_fd;
+        log_debug_errno(r, "Failed to reopen fd %i, using a dup instead: %m", fd);
+
+        _cleanup_close_ int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        if (dup_fd < 0)
+                return -errno;
+
+        r = fd_nonblock(dup_fd, true);
+        if (r < 0)
+                return r;
+
+        return TAKE_FD(dup_fd);
 }
 
 int fd_reopen_condition(

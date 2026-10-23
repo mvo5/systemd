@@ -256,6 +256,11 @@ systemd-run --scope --property=Conflicts=slowly-activating.service --job-mode=re
 SHELL=/bin/true systemd-run --shell
 SHELL=/bin/true systemd-run --scope --shell
 systemd-run --wait --pty true
+
+# A regular file on stdout keeps the shared file offset: what the shell writes after us must not clobber our output
+{ echo header; systemd-run --wait --pty --quiet echo hello; echo trailer; } >/tmp/pty-offset.out
+[[ "$(tr -d '\r' </tmp/pty-offset.out)" == "$(printf 'header\nhello\ntrailer')" ]]
+rm -f /tmp/pty-offset.out
 systemd-run --wait --machine=.host --pty true
 systemd-run --json=short true | jq . >/dev/null
 systemd-run --json=pretty true | jq . >/dev/null

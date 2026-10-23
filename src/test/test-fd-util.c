@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <sys/eventfd.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -474,6 +475,51 @@ TEST(fd_reopen) {
         /* So here's the thing: if we have an O_PATH fd to a symlink, we *cannot* convert it to a regular fd
          * with that. i.e. you cannot have the VFS follow a symlink pinned via an O_PATH fd. */
         assert_se(fd_reopen(fd1, O_RDONLY|O_CLOEXEC) == -ELOOP);
+}
+
+TEST(fd_reopen_nonblock) {
+        _cleanup_(unlink_tempfilep) char path[] = "/tmp/test-fd-reopen-nonblock.XXXXXX";
+        _cleanup_close_ int fd = -EBADF, nfd = -EBADF;
+        int p[2], sv[2], fl;
+        char c;
+
+        /* Regular file: a dup, the file offset stays shared with the original */
+        fd = mkostemp_safe(path);
+        assert_se(fd >= 0);
+        nfd = fd_reopen_nonblock(fd, O_WRONLY);
+        assert_se(nfd >= 0);
+        assert_se(write(nfd, "hello", 5) == 5);
+        assert_se(lseek(fd, 0, SEEK_CUR) == 5);
+        nfd = safe_close(nfd);
+        fd = safe_close(fd);
+
+        /* Pipe: a reopen, O_NONBLOCK only on the new description */
+        assert_se(pipe2(p, O_CLOEXEC) >= 0);
+        nfd = fd_reopen_nonblock(p[0], O_RDONLY);
+        assert_se(nfd >= 0);
+        fl = fcntl(nfd, F_GETFL);
+        assert_se(fl >= 0);
+        assert_se(FLAGS_SET(fl, O_NONBLOCK));
+        fl = fcntl(p[0], F_GETFL);
+        assert_se(fl >= 0);
+        assert_se(!FLAGS_SET(fl, O_NONBLOCK));
+        assert_se(write(p[1], "x", 1) == 1);
+        assert_se(read(nfd, &c, 1) == 1);
+        assert_se(c == 'x');
+        assert_se(read(nfd, &c, 1) < 0);
+        assert_se(errno == EAGAIN);
+        nfd = safe_close(nfd);
+        safe_close_pair(p);
+
+        /* Socket: cannot be reopened, a dup with O_NONBLOCK on the shared description */
+        assert_se(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, sv) >= 0);
+        nfd = fd_reopen_nonblock(sv[0], O_RDWR);
+        assert_se(nfd >= 0);
+        fl = fcntl(sv[0], F_GETFL);
+        assert_se(fl >= 0);
+        assert_se(FLAGS_SET(fl, O_NONBLOCK));
+        nfd = safe_close(nfd);
+        safe_close_pair(sv);
 }
 
 TEST(fd_reopen_condition) {

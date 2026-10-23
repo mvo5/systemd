@@ -377,6 +377,10 @@ SERVE_TMPDIR="$(mktemp -d)"
 echo "untrusted data decompressed safely via varlink serve" | gzip >"$SERVE_TMPDIR/compressed.gz"
 result="$(varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.Compress.Decompress '{}' <"$SERVE_TMPDIR/compressed.gz")"
 echo "$result" | grep "untrusted data decompressed safely" >/dev/null
+
+# A regular file on stdout keeps the shared file offset: what the shell writes after us must not clobber our output
+{ echo header; varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.Compress.Decompress '{}' <"$SERVE_TMPDIR/compressed.gz"; echo trailer; } >"$SERVE_TMPDIR/out"
+[[ "$(cat "$SERVE_TMPDIR/out")" == "$(printf 'header\nuntrusted data decompressed safely via varlink serve\ntrailer')" ]]
 kill "$SERVE_PID" 2>/dev/null || true
 wait "$SERVE_PID" 2>/dev/null || true
 rm -f "$SERVE_SOCKET"
