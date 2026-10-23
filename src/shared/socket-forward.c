@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -14,16 +15,15 @@
 
 #define SOCKET_FORWARD_BUFFER_SIZE (256 * 1024)
 
-/* Unidirectional forwarder: splices data from read_fd to write_fd via a kernel pipe buffer.
+/* Unidirectional forwarder: copies data from read_fd to write_fd through a userspace buffer.
  * Each direction of a full-duplex SocketForward is handled by one of these. */
 typedef struct SimplexForward {
         sd_event *event;
 
         int read_fd, write_fd;
 
-        int buffer[2]; /* a pipe */
-
-        size_t buffer_full, buffer_size;
+        uint8_t *buffer;
+        size_t buffer_start, buffer_end; /* pending data is buffer[buffer_start..buffer_end) */
 
         sd_event_source *read_event_source, *write_event_source;
 
@@ -41,7 +41,7 @@ static SimplexForward* simplex_forward_free(SimplexForward *fwd) {
         safe_close(fwd->read_fd);
         safe_close(fwd->write_fd);
 
-        safe_close_pair(fwd->buffer);
+        free(fwd->buffer);
 
         sd_event_unref(fwd->event);
 
@@ -50,75 +50,64 @@ static SimplexForward* simplex_forward_free(SimplexForward *fwd) {
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(SimplexForward*, simplex_forward_free);
 
-static int socket_forward_create_pipes(int buffer[static 2], size_t *ret_size) {
-        int r;
+static bool simplex_forward_has_room(const SimplexForward *fwd) {
+        assert(fwd);
 
-        assert(buffer);
-        assert(ret_size);
-
-        if (buffer[0] >= 0)
-                return 0;
-
-        r = pipe2(buffer, O_CLOEXEC|O_NONBLOCK);
-        if (r < 0)
-                return log_debug_errno(errno, "Failed to allocate pipe buffer: %m");
-
-        (void) fcntl(buffer[0], F_SETPIPE_SZ, SOCKET_FORWARD_BUFFER_SIZE);
-
-        r = fcntl(buffer[0], F_GETPIPE_SZ);
-        if (r < 0)
-                return log_debug_errno(errno, "Failed to get pipe buffer size: %m");
-
-        assert(r > 0);
-        *ret_size = r;
-
-        return 0;
+        /* Pending data is compacted to the front of the buffer when the tail is full. Only do that once
+         * half of the buffer has been written out, so that a slow writer doesn't make us move a nearly
+         * full buffer for every few bytes it accepts. */
+        return fwd->buffer_end < SOCKET_FORWARD_BUFFER_SIZE ||
+                fwd->buffer_start >= SOCKET_FORWARD_BUFFER_SIZE / 2;
 }
 
-static int simplex_forward_shovel(
-                int *from, int buffer[2], int *to,
-                size_t *full, size_t *sz,
-                sd_event_source **from_source, sd_event_source **to_source) {
+static ssize_t simplex_forward_read(SimplexForward *fwd) {
+        assert(fwd);
+        assert(fwd->read_fd >= 0);
+        assert(simplex_forward_has_room(fwd));
 
+        if (fwd->buffer_start == fwd->buffer_end)
+                fwd->buffer_start = fwd->buffer_end = 0;
+        else if (fwd->buffer_end >= SOCKET_FORWARD_BUFFER_SIZE) {
+                memmove(fwd->buffer, fwd->buffer + fwd->buffer_start, fwd->buffer_end - fwd->buffer_start);
+                fwd->buffer_end -= fwd->buffer_start;
+                fwd->buffer_start = 0;
+        }
+
+        return read(fwd->read_fd, fwd->buffer + fwd->buffer_end, SOCKET_FORWARD_BUFFER_SIZE - fwd->buffer_end);
+}
+
+static int simplex_forward_shovel(SimplexForward *fwd) {
         bool shoveled;
 
-        assert(from);
-        assert(buffer);
-        assert(buffer[0] >= 0);
-        assert(buffer[1] >= 0);
-        assert(to);
-        assert(full);
-        assert(sz);
-        assert(from_source);
-        assert(to_source);
+        assert(fwd);
 
         do {
                 ssize_t z;
 
                 shoveled = false;
 
-                if (*full < *sz && *from >= 0 && *to >= 0) {
-                        z = splice(*from, NULL, buffer[1], NULL, *sz - *full, SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+                if (fwd->read_fd >= 0 && fwd->write_fd >= 0 && simplex_forward_has_room(fwd)) {
+                        z = simplex_forward_read(fwd);
                         if (z > 0) {
-                                *full += z;
+                                fwd->buffer_end += z;
                                 shoveled = true;
                         } else if (z == 0 || ERRNO_IS_DISCONNECT(errno)) {
-                                *from_source = sd_event_source_unref(*from_source);
-                                *from = safe_close(*from);
+                                fwd->read_event_source = sd_event_source_unref(fwd->read_event_source);
+                                fwd->read_fd = safe_close(fwd->read_fd);
                         } else if (!ERRNO_IS_TRANSIENT(errno))
-                                return log_debug_errno(errno, "Failed to splice: %m");
+                                return log_debug_errno(errno, "Failed to read from fd %i: %m", fwd->read_fd);
                 }
 
-                if (*full > 0 && *to >= 0) {
-                        z = splice(buffer[0], NULL, *to, NULL, *full, SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+                if (fwd->buffer_end > fwd->buffer_start && fwd->write_fd >= 0) {
+                        z = write(fwd->write_fd, fwd->buffer + fwd->buffer_start, fwd->buffer_end - fwd->buffer_start);
                         if (z > 0) {
-                                *full -= z;
+                                fwd->buffer_start += z;
                                 shoveled = true;
                         } else if (z == 0 || ERRNO_IS_DISCONNECT(errno)) {
-                                *to_source = sd_event_source_unref(*to_source);
-                                *to = safe_close(*to);
+                                fwd->write_event_source = sd_event_source_unref(fwd->write_event_source);
+                                fwd->write_fd = safe_close(fwd->write_fd);
                         } else if (!ERRNO_IS_TRANSIENT(errno))
-                                return log_debug_errno(errno, "Failed to splice: %m");
+                                return log_debug_errno(errno, "Failed to write to fd %i: %m", fwd->write_fd);
                 }
         } while (shoveled);
 
@@ -130,15 +119,12 @@ static int simplex_forward_enable_event_sources(SimplexForward *fwd);
 static int simplex_forward_traffic(SimplexForward *fwd) {
         int r;
 
-        r = simplex_forward_shovel(
-                        &fwd->read_fd, fwd->buffer, &fwd->write_fd,
-                        &fwd->buffer_full, &fwd->buffer_size,
-                        &fwd->read_event_source, &fwd->write_event_source);
+        r = simplex_forward_shovel(fwd);
         if (r < 0)
                 goto quit;
 
         /* Read side closed and all buffered data written? */
-        if (fwd->read_fd < 0 && fwd->buffer_full <= 0)
+        if (fwd->read_fd < 0 && fwd->buffer_start >= fwd->buffer_end)
                 goto quit;
 
         /* Write side closed? */
@@ -175,8 +161,8 @@ static int simplex_forward_enable_event_sources(SimplexForward *fwd) {
 
         assert(fwd);
 
-        can_read = fwd->buffer_full < fwd->buffer_size;
-        can_write = fwd->buffer_full > 0;
+        can_read = simplex_forward_has_room(fwd);
+        can_write = fwd->buffer_end > fwd->buffer_start;
 
         /* Event sources may have been unref'd by the shovel on EOF/disconnect */
         if (fwd->read_event_source) {
@@ -241,12 +227,20 @@ static int simplex_forward_new(
                 .event = sd_event_ref(event),
                 .read_fd = read_fd,
                 .write_fd = write_fd,
-                .buffer = EBADF_PAIR,
                 .on_done = on_done,
                 .userdata = userdata,
         };
 
-        r = socket_forward_create_pipes(fwd->buffer, &fwd->buffer_size);
+        fwd->buffer = new(uint8_t, SOCKET_FORWARD_BUFFER_SIZE);
+        if (!fwd->buffer)
+                return log_oom_debug();
+
+        /* All forwarding runs in one event loop, a single blocking read() or write() would stall every direction. */
+        r = fd_nonblock(fwd->read_fd, true);
+        if (r < 0)
+                return r;
+
+        r = fd_nonblock(fwd->write_fd, true);
         if (r < 0)
                 return r;
 

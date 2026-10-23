@@ -3,15 +3,14 @@
 
 #include "forward.h"
 
-/* Bidirectional forwarder using splice().
+/* Bidirectional forwarder.
  *
- * Forwards data between two sides ("server" and "client") via kernel pipe buffers,
- * avoiding userspace copies. Internally uses two independent half-duplex forwarders,
- * one per direction. All four fds must be distinct - use dup()/fcntl(fd, F_DUPFD_CLOEXEC, 3) for bidirectional sockets.
+ * Forwards data between two sides ("server" and "client") through a userspace buffer per direction.
+ * Internally uses two independent half-duplex forwarders, one per direction. All four fds must be
+ * distinct - use dup()/fcntl(fd, F_DUPFD_CLOEXEC, 3) for bidirectional sockets.
  *
- * SPLICE_F_NONBLOCK only applies to the internal pipe, not to the fds being spliced from/to. Since all
- * forwarding runs in one event loop, sockets and ttys must be O_NONBLOCK or a single blocking splice()
- * stalls every direction. Pipes and regular files do not need it.
+ * All fds are switched to O_NONBLOCK. Pass reopened fds (see fd_reopen()) if the open file description
+ * is shared with another process that should not see that, e.g. a shell's terminal.
  *
  * When forwarding completes (both directions reach EOF or error), the completion callback is invoked.
  *
