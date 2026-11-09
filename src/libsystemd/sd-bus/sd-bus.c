@@ -2079,6 +2079,56 @@ static int bus_write_message(sd_bus *bus, sd_bus_message *m, size_t *idx) {
         return r;
 }
 
+static void wqueue_drop_head(sd_bus *bus) {
+        assert(bus);
+        assert(bus->wqueue_size > 0);
+
+        /* This isn't particularly optimized, but well, this is supposed to be our worst-case buffer only,
+         * and the socket buffer is supposed to be our primary buffer, and if it got full, then all bets are
+         * off anyway. */
+
+        bus->wqueue_size--;
+        bus_message_unref_queued(bus->wqueue[0], bus);
+        memmove(bus->wqueue, bus->wqueue + 1, sizeof(sd_bus_message*) * bus->wqueue_size);
+        bus->windex = 0;
+}
+
+static int wqueue_reject_fds(sd_bus *bus, sd_bus_message *m) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *e = NULL;
+        int r;
+
+        assert(bus);
+        assert(m);
+
+        /* Queued before the connection was set up, and the peer then did not negotiate fd passing. */
+
+        if (m->header->type != SD_BUS_MESSAGE_METHOD_CALL ||
+            FLAGS_SET(m->header->flags, BUS_MESSAGE_NO_REPLY_EXPECTED))
+                return 0;
+
+        r = bus_message_new_synthetic_error(
+                        bus,
+                        BUS_MESSAGE_COOKIE(m),
+                        &SD_BUS_ERROR_MAKE_CONST(SD_BUS_ERROR_NOT_SUPPORTED,
+                                                 "Peer does not support file descriptor passing"),
+                        &e);
+        if (r < 0)
+                return r;
+
+        e->read_counter = ++bus->read_counter;
+
+        r = bus_seal_synthetic_message(bus, e);
+        if (r < 0)
+                return r;
+
+        r = bus_rqueue_make_room(bus);
+        if (r < 0)
+                return r;
+
+        bus->rqueue[bus->rqueue_size++] = bus_message_ref_queued(e, bus);
+        return 0;
+}
+
 static int dispatch_wqueue(sd_bus *bus) {
         int r, ret = 0;
 
@@ -2086,29 +2136,25 @@ static int dispatch_wqueue(sd_bus *bus) {
         assert(IN_SET(bus->state, BUS_RUNNING, BUS_HELLO));
 
         while (bus->wqueue_size > 0) {
+                sd_bus_message *m = bus->wqueue[0];
 
-                r = bus_write_message(bus, bus->wqueue[0], &bus->windex);
+                if (m->n_fds > 0 && !bus->can_fds) {
+                        r = wqueue_reject_fds(bus, m);
+                        if (r < 0)
+                                return r;
+
+                        wqueue_drop_head(bus);
+                        continue;
+                }
+
+                r = bus_write_message(bus, m, &bus->windex);
                 if (r < 0)
                         return r;
                 if (r == 0)
                         /* Didn't do anything this time */
                         return ret;
-                if (bus->windex >= BUS_MESSAGE_SIZE(bus->wqueue[0])) {
-                        /* Fully written. Let's drop the entry from
-                         * the queue.
-                         *
-                         * This isn't particularly optimized, but
-                         * well, this is supposed to be our worst-case
-                         * buffer only, and the socket buffer is
-                         * supposed to be our primary buffer, and if
-                         * it got full, then all bets are off
-                         * anyway. */
-
-                        bus->wqueue_size--;
-                        bus_message_unref_queued(bus->wqueue[0], bus);
-                        memmove(bus->wqueue, bus->wqueue + 1, sizeof(sd_bus_message*) * bus->wqueue_size);
-                        bus->windex = 0;
-
+                if (bus->windex >= BUS_MESSAGE_SIZE(m)) {
+                        wqueue_drop_head(bus);
                         ret = 1;
                 }
         }
@@ -2187,10 +2233,12 @@ _public_ int sd_bus_send(sd_bus *bus, sd_bus_message *_m, uint64_t *ret_cookie) 
                 return -ENOTCONN;
 
         if (m->n_fds > 0) {
-                r = sd_bus_can_send(bus, SD_BUS_TYPE_UNIX_FD);
-                if (r < 0)
-                        return r;
-                if (r == 0)
+                if (bus->is_monitor || !bus->accept_fd)
+                        return -EOPNOTSUPP;
+
+                /* fd passing is negotiated on connect; until then the message is queued and dispatch_wqueue()
+                 * checks. */
+                if (IN_SET(bus->state, BUS_RUNNING, BUS_HELLO) && !bus->can_fds)
                         return -EOPNOTSUPP;
         }
 

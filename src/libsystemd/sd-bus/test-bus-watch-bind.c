@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <fcntl.h>
+
 #include "sd-bus.h"
 #include "sd-event.h"
 #include "sd-future.h"
@@ -26,6 +28,18 @@ static int method_foobar(sd_bus_message *m, void *userdata, sd_bus_error *ret_er
         return sd_bus_reply_method_return(m, /* types= */ NULL);
 }
 
+static int method_pass_fd(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
+        int fd;
+
+        log_info("Got PassFd() call.");
+
+        ASSERT_OK(sd_bus_message_read(m, "h", &fd));
+        ASSERT_OK(fd);
+
+        ASSERT_OK(sd_event_exit(sd_bus_get_event(sd_bus_message_get_bus(m)), /* code= */ 0));
+        return sd_bus_reply_method_return(m, /* types= */ NULL);
+}
+
 static int method_exit(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
         log_info("Got Exit() call");
 
@@ -38,6 +52,7 @@ static int method_exit(sd_bus_message *m, void *userdata, sd_bus_error *ret_erro
 static const sd_bus_vtable vtable[] = {
         SD_BUS_VTABLE_START(0),
         SD_BUS_METHOD("Foobar", NULL, NULL, method_foobar, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("PassFd", "h", NULL, method_pass_fd, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Exit", NULL, NULL, method_exit, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_VTABLE_END,
 };
@@ -175,10 +190,56 @@ static int client2(void *userdata) {
         return 0;
 }
 
+static int client3_reply(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
+        int *replied = ASSERT_PTR(userdata);
+
+        ASSERT_OK_ZERO(sd_bus_message_is_method_error(m, /* name= */ NULL));
+        *replied = 1;
+        return 0;
+}
+
+static int client3(void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        const char *path = ASSERT_PTR(userdata), *t;
+        int replied = 0, r;
+
+        log_debug("Initializing client3");
+
+        ASSERT_OK(sd_bus_new(&bus));
+        ASSERT_OK(sd_bus_set_description(bus, "client3"));
+
+        t = strjoina("unix:path=", path);
+        ASSERT_OK(sd_bus_set_address(bus, t));
+        ASSERT_OK(sd_bus_set_watch_bind(bus, true));
+        ASSERT_OK(sd_bus_start(bus));
+
+        /* The socket does not exist yet, so the call has to queue rather than wait for it. */
+        ASSERT_OK_ERRNO(fd = open("/dev/null", O_RDONLY|O_CLOEXEC));
+        ASSERT_OK(sd_bus_message_new_method_call(bus, &m, "foo.bar", "/foo", "foo.TestInterface", "PassFd"));
+        ASSERT_OK(sd_bus_message_append(m, "h", fd));
+        ASSERT_OK(sd_bus_call_async(bus, /* ret_slot= */ NULL, m, client3_reply, &replied, /* usec= */ 0));
+        ASSERT_OK_ZERO(sd_bus_is_ready(bus));
+
+        while (replied == 0) {
+                ASSERT_OK(r = sd_bus_process(bus, /* ret= */ NULL));
+                if (r > 0)
+                        continue;
+
+                ASSERT_OK(sd_bus_wait(bus, UINT64_MAX));
+        }
+
+        log_debug("Client3 done");
+
+        return 0;
+}
+
 typedef struct RequestExitArgs {
         const char *path;
         sd_future *client1;
         sd_future *client2;
+        sd_future *client3;
 } RequestExitArgs;
 
 static int request_exit(void *userdata) {
@@ -189,8 +250,10 @@ static int request_exit(void *userdata) {
         /* Wait for all client fibers to complete before requesting exit */
         ASSERT_OK(sd_fiber_await(args->client1));
         ASSERT_OK(sd_fiber_await(args->client2));
+        ASSERT_OK(sd_fiber_await(args->client3));
         ASSERT_OK(sd_future_result(args->client1));
         ASSERT_OK(sd_future_result(args->client2));
+        ASSERT_OK(sd_future_result(args->client3));
 
         ASSERT_OK(sd_bus_new(&bus));
 
@@ -208,7 +271,7 @@ static int request_exit(void *userdata) {
 int main(int argc, char *argv[]) {
         _cleanup_(rm_rf_physical_and_freep) char *d = NULL;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
-        _cleanup_(sd_future_unrefp) sd_future *f_server = NULL, *f_client1 = NULL, *f_client2 = NULL, *f_exit = NULL;
+        _cleanup_(sd_future_unrefp) sd_future *f_server = NULL, *f_client1 = NULL, *f_client2 = NULL, *f_client3 = NULL, *f_exit = NULL;
         char *path;
 
         test_setup_logging(LOG_DEBUG);
@@ -226,11 +289,13 @@ int main(int argc, char *argv[]) {
 
         ASSERT_OK(sd_fiber_new(e, "client-1", client1, path, &f_client1));
         ASSERT_OK(sd_fiber_new(e, "client-2", client2, path, &f_client2));
+        ASSERT_OK(sd_fiber_new(e, "client-3", client3, path, &f_client3));
 
         RequestExitArgs args = {
                 .path = path,
                 .client1 = f_client1,
                 .client2 = f_client2,
+                .client3 = f_client3,
         };
         ASSERT_OK(sd_fiber_new(e, "request-exit", request_exit, &args, &f_exit));
 
@@ -238,6 +303,7 @@ int main(int argc, char *argv[]) {
 
         ASSERT_OK(sd_future_result(f_client1));
         ASSERT_OK(sd_future_result(f_client2));
+        ASSERT_OK(sd_future_result(f_client3));
         ASSERT_OK(sd_future_result(f_exit));
         ASSERT_OK(sd_future_result(f_server));
 
