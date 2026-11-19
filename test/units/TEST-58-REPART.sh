@@ -3024,6 +3024,71 @@ EOF
     cmp "$imgs/test1.img" "$imgs/test2.img"
 }
 
+testcase_verity_signature_reproducibility() {
+    local defs imgs i
+
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs'" RETURN
+    chmod 0755 "$defs"
+
+    # erofs is not mounted when populated, so the data partition (and with it the root hash) is
+    # reproducible in online mode too
+    tee "$defs/verity-data.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+Format=erofs
+CopyFiles=${defs}
+Verity=data
+VerityMatchKey=root
+Minimize=best
+EOF
+
+    tee "$defs/verity-hash.conf" <<EOF
+[Partition]
+Type=root-${architecture}-verity
+Verity=hash
+VerityMatchKey=root
+Minimize=yes
+EOF
+
+    tee "$defs/verity-sig.conf" <<EOF
+[Partition]
+Type=root-${architecture}-verity-sig
+Verity=signature
+VerityMatchKey=root
+EOF
+
+    # RSA signatures are always deterministic, only ECDSA uses a random nonce by default
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout "$defs/verity.key" -out "$defs/verity.crt" -subj /CN=verity -days 2
+
+    for i in 1 2; do
+        env SOURCE_DATE_EPOCH=1700000000 SYSTEMD_LOG_LEVEL=debug \
+            systemd-repart \
+            --offline="$OFFLINE" \
+            --definitions="$defs" \
+            --empty=create \
+            --size=auto \
+            --seed="$seed" \
+            --dry-run=no \
+            --private-key="$defs/verity.key" \
+            --certificate="$defs/verity.crt" \
+            "$imgs/test$i.img" 2>"$imgs/test$i.log"
+
+        sleep 2
+    done
+
+    # Deterministic ECDSA needs OpenSSL >= 3.2
+    if ! grep "Enabled deterministic ECDSA signature" "$imgs/test1.log" >/dev/null; then
+        echo "Skipping verity signature reproducibility check, no deterministic ECDSA support."
+        return 0
+    fi
+
+    cmp "$imgs/test1.img" "$imgs/test2.img"
+}
+
 testcase_vfat_reproducibility() {
     local defs imgs img dot_efi dot_linux
 
